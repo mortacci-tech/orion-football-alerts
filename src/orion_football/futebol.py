@@ -16,11 +16,6 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = BASE_DIR.parent.parent
-RAW_DIR = PROJECT_DIR / 'data' / 'raw'
-NORMALIZED_DIR = PROJECT_DIR / 'data' / 'normalized'
-STATE_DIR = PROJECT_DIR / 'state'
-ALERTS_DIR = STATE_DIR
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
 ALERT_LEDGER_PATH = BASE_DIR.parent.parent / 'state' / 'alerts.json'
@@ -310,14 +305,15 @@ def local_today(config: dict[str, Any], now: datetime | None = None) -> date:
     current = now.astimezone(timezone) if now else datetime.now(timezone)
     return current.date()
 
-def render_daily_preview(config: dict[str, Any], data: dict[str, Any], selected_date: date | str) -> str:
+def render_daily_preview(config: dict[str, Any], data: dict[str, Any], selected_date: date | str, today: bool = False) -> str:
     target = parse_schedule_date(selected_date) if isinstance(selected_date, str) else selected_date
     matches = select_matches_by_date(data, target)
     if not matches:
         return f'⚽ NÃO HÁ JOGOS EM {target:%d/%m/%Y}'
     owner = config['owner_team']
     owner_matches = [match for match in matches if owner.casefold() in {match['home_team'].casefold(), match['away_team'].casefold()}]
-    lines = [f'🔴⚫ HOJE TEM {owner.upper()}' if owner_matches else '⚽ JOGOS DE HOJE', '']
+    date_label = 'HOJE' if today else f'{target:%d/%m/%Y}'
+    lines = [f'🔴⚫ {date_label} TEM {owner.upper()}' if owner_matches and today else f'🔴⚫ {owner.upper()} EM {target:%d/%m/%Y}' if owner_matches else f'⚽ JOGOS DE {date_label}', '']
     selected = owner_matches + [match for match in matches if match not in owner_matches]
     if owner_matches:
         selected_owner = owner_matches[0]
@@ -512,12 +508,6 @@ def render_location(match: dict[str, Any]) -> str:
 def capitalize_pt(value: str) -> str:
     return value[:1].upper() + value[1:].lower()
 
-def cmd_fetch(args: argparse.Namespace) -> int:
-    raise FutebolError('Download automático não está habilitado nesta missão; use a fixture local.')
-
-def cmd_send(args: argparse.Namespace) -> int:
-    raise FutebolError('Envio não está habilitado nesta missão.')
-
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
     if args.source == 'fixture':
@@ -535,15 +525,13 @@ def cmd_normalize(args: argparse.Namespace) -> int:
 
 def cmd_preview(args: argparse.Namespace) -> int:
     config = load_config()
-    try:
-        data = load_normalized(config, args.source)
-    except FutebolError:
-        if args.source != 'fixture':
-            raise
+    if args.source == 'fixture':
         data = normalize_snapshot(config, fetch_fixture(config))
+    else:
+        data = load_normalized(config, args.source)
     if args.date or args.today:
         selected_date = local_today(config) if args.today else args.date
-        print(render_daily_preview(config, data, selected_date))
+        print(render_daily_preview(config, data, selected_date, today=args.today))
     else:
         print(render_preview(data, round_number=args.round, current=args.current))
     return 0
@@ -594,7 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest='command', required=True)
     fetch_parser = subparsers.add_parser('fetch')
     fetch_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
-    fetch_parser.set_defaults(func=cmd_fetch)
+    fetch_parser.set_defaults(func=lambda _args: (_ for _ in ()).throw(FutebolError('Download automático não está habilitado nesta missão; use a fixture local.')))
     normalize_parser = subparsers.add_parser('normalize')
     normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
@@ -625,7 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument('--alert-type', choices=['round_overview', 'owner_team_round'], required=True)
     send_parser.add_argument('--self-only', action='store_true', required=True)
     send_parser.add_argument('--confirm', required=True)
-    send_parser.set_defaults(func=cmd_send)
+    send_parser.set_defaults(func=lambda _args: (_ for _ in ()).throw(FutebolError('Envio não está habilitado nesta missão.')))
     return parser
 
 def main(argv: list[str] | None=None) -> int:
