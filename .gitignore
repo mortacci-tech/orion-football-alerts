@@ -14,3 +14,7 @@ downloads/
 *_real.json
 *_ledger.json
 secrets/
+
+# Internal handoff files
+HANDOFF-PARA-CHATGPT.txt
+*HANDOFF*.txt
