@@ -80,10 +80,86 @@ class FutebolTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("invalid choice", error)
 
-    def test_source_real_nao_aceito(self):
-        code, _, error = self.run_cli("normalize", "--source", "real")
-        self.assertNotEqual(code, 0)
-        self.assertIn("unrecognized arguments", error)
+    def test_source_real_aceito(self):
+        self.assertEqual(futebol.build_parser().parse_args(["normalize", "--source", "real"]).source, "real")
+
+    def test_fixture_eh_padrao(self):
+        self.assertEqual(futebol.build_parser().parse_args(["normalize"]).source, "fixture")
+
+    def test_hash_e_metadados_fixture(self):
+        c, d = self.data()
+        self.assertEqual(d['source']['provider'], 'CBF')
+        self.assertTrue(d['source']['source_url'])
+        self.assertEqual(len(d['source']['document_sha256']), 64)
+        self.assertTrue(d['source']['captured_at'])
+
+    def test_parser_amostra_oficial_congelada(self):
+        c = futebol.load_config()
+        sample = Path(futebol.BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_oficial_sample.html').read_text()
+        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), sample, None)
+        data = futebol.normalize_snapshot(c, source)
+        self.assertEqual(data['data_mode'], 'real')
+        self.assertEqual(len(data['matches']), 2)
+
+    def test_estrutura_real_nao_reconhecida_falha(self):
+        c = futebol.load_config()
+        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), '<html>sem tabela</html>', None)
+        with self.assertRaises(futebol.FutebolError): futebol.normalize_snapshot(c, source)
+
+    def test_download_rejeita_http_e_vazio(self):
+        c = futebol.load_config(); c['source']['official_url'] = futebol.REAL_URL_DEFAULT
+        with patch('urllib.request.urlopen', side_effect=futebol.urllib.error.HTTPError(futebol.REAL_URL_DEFAULT, 503, 'down', {}, io.BytesIO())):
+            with self.assertRaisesRegex(futebol.FutebolError, 'HTTP 503'): futebol.fetch_real(c)
+
+    def test_download_usa_timeout_e_rejeita_vazio(self):
+        c = futebol.load_config()
+        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'text/html'})(), 'read': lambda self, n: b'', 'getcode': lambda self: 200, '__enter__': lambda self: self, '__exit__': lambda *args: None})()
+        with patch('urllib.request.urlopen', return_value=response) as mocked:
+            with self.assertRaisesRegex(futebol.FutebolError, 'vazia'): futebol.fetch_real(c)
+        self.assertEqual(mocked.call_args.kwargs['timeout'], 20.0)
+
+    def real_source(self):
+        c = futebol.load_config()
+        sample = Path(futebol.BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_oficial_sample.html').read_text()
+        return c, futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), sample, None)
+
+    def test_download_rejeita_tipo_inesperado(self):
+        c = futebol.load_config()
+        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'application/pdf'})(), '__enter__': lambda self: self, '__exit__': lambda *args: None})()
+        with patch('urllib.request.urlopen', return_value=response):
+            with self.assertRaisesRegex(futebol.FutebolError, 'Tipo de conteúdo'): futebol.fetch_real(c)
+
+    def test_download_rejeita_tamanho_maximo(self):
+        c = futebol.load_config(); c['source']['max_download_bytes'] = 3
+        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'text/html'})(), 'read': lambda self, n: b'abcd', '__enter__': lambda self: self, '__exit__': lambda *args: None})()
+        with patch('urllib.request.urlopen', return_value=response):
+            with self.assertRaisesRegex(futebol.FutebolError, 'limite'): futebol.fetch_real(c)
+
+    def test_preview_real_por_rodada_data_e_today_offline(self):
+        c, source = self.real_source()
+        for args in [('preview', '--source', 'real', '--current'), ('preview', '--source', 'real', '--date', '2026-07-16'), ('preview', '--source', 'real', '--today')]:
+            with self.subTest(args=args), patch.object(futebol, 'fetch_real', return_value=source):
+                code, output, error = self.run_cli(*args)
+                self.assertEqual((code, error), (0, ''))
+                self.assertTrue(output)
+
+    def test_real_nao_chama_rede_no_parser(self):
+        c, source = self.real_source()
+        with patch('urllib.request.urlopen') as network:
+            data = futebol.normalize_snapshot(c, source)
+        network.assert_not_called()
+        self.assertEqual(data['data_mode'], 'real')
+
+    def test_real_preview_mantem_campos_ausentes(self):
+        c, source = self.real_source(); data = futebol.normalize_snapshot(c, source)
+        data['matches'][0]['venue'] = ''; data['matches'][0]['city'] = ''; data['matches'][0]['state'] = ''
+        self.assertIn('Local: ainda não informado', futebol.render_preview(data, round_number=19))
+
+    def test_json_real_normaliza(self):
+        c = futebol.load_config()
+        payload = '{"jogos":[{"id":"x1","rodada":19,"mandante":"A","visitante":"B","data":"2026-07-16","horario":"19:30"}]}'
+        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), payload, None, 'json')
+        self.assertEqual(len(futebol.normalize_snapshot(c, source)['matches']), 1)
 
     def test_cli_normalize_funciona(self):
         code, output, error = self.run_cli("normalize")

@@ -6,6 +6,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
+REAL_URL_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/tabelas/campeonato-brasileiro/serie-a/2026?doc=Tabela%20Detalhada'
 DATA_DIR = BASE_DIR.parent.parent / 'data'
 RAW_DIR = DATA_DIR / 'raw'
 NORMALIZED_DIR = DATA_DIR / 'normalized'
@@ -37,6 +40,9 @@ class SourceSnapshot:
     fetched_at: str
     html_text: str
     raw_path: Path | None
+    source_format: str = 'html'
+    document_sha256: str = ''
+    content_length: int = 0
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
@@ -58,7 +64,51 @@ def fetch_fixture(config: dict[str, Any]) -> SourceSnapshot:
     if not FIXTURE_PATH.exists():
         raise FutebolError(f'Fixture não encontrada: {FIXTURE_PATH}')
     tz_name = config['timezone']
-    return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=FIXTURE_PATH.read_text(encoding='utf-8'), raw_path=None)
+    text = FIXTURE_PATH.read_text(encoding='utf-8')
+    return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=text, raw_path=None, document_sha256=hashlib.sha256(text.encode()).hexdigest(), content_length=len(text.encode()))
+
+def source_url(config: dict[str, Any]) -> str:
+    configured = config.get('source', {}).get('official_url') or REAL_URL_DEFAULT
+    if not configured.startswith(('https://www.cbf.com.br/', 'https://cms.cbf.com.br/')):
+        raise FutebolError('Fonte real exige uma URL HTTPS oficial da CBF em source.official_url.')
+    return configured
+
+def fetch_real(config: dict[str, Any]) -> SourceSnapshot:
+    url = source_url(config)
+    source_config = config.get('source', {})
+    timeout = float(source_config.get('timeout_seconds', 20))
+    max_bytes = int(source_config.get('max_download_bytes', 5_000_000))
+    request = urllib.request.Request(url, headers={'User-Agent': 'orion-football-alerts/0.1 (official CBF source reader)', 'Accept': 'text/html,application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = getattr(response, 'status', None) or response.getcode()
+            if status < 200 or status >= 300:
+                raise FutebolError(f'Fonte CBF respondeu HTTP {status}.')
+            content_type = response.headers.get_content_type().lower()
+            if content_type not in {'text/html', 'application/json', 'text/plain'}:
+                raise FutebolError(f'Tipo de conteúdo inesperado da CBF: {content_type}.')
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(min(65536, max_bytes - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FutebolError(f'Download da CBF excede o limite de {max_bytes} bytes.')
+                chunks.append(chunk)
+    except urllib.error.HTTPError as exc:
+        raise FutebolError(f'Fonte CBF respondeu HTTP {exc.code}.') from exc
+    except urllib.error.URLError as exc:
+        raise FutebolError(f'Falha ao acessar a fonte CBF: {exc.reason}.') from exc
+    body = b''.join(chunks)
+    if not body:
+        raise FutebolError('Resposta vazia da fonte CBF.')
+    source_format = 'json' if content_type == 'application/json' else 'html'
+    ensure_dirs()
+    raw_path = RAW_DIR / f'cbf_{config["season"]}_real.{source_format}'
+    raw_path.write_bytes(body)
+    return SourceSnapshot('CBF', url, 'real', now_iso(config['timezone']), body.decode('utf-8', errors='replace'), raw_path, source_format, hashlib.sha256(body).hexdigest(), len(body))
 
 def clean_text(value: str) -> str:
     value = html.unescape(re.sub('<[^>]+>', ' ', value))
@@ -73,6 +123,35 @@ def extract_rows(html_text: str) -> list[list[str]]:
             rows.append(cleaned)
     if not rows:
         raise FutebolError('Nenhuma linha de partida encontrada na estrutura HTML esperada da CBF.')
+    return rows
+
+def extract_json_rows(text: str) -> list[list[str]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise FutebolError('JSON da CBF inválido.') from exc
+    games = payload.get('matches') or payload.get('jogos') or payload.get('data')
+    if isinstance(games, dict):
+        games = games.get('jogos') or games.get('matches')
+    if not isinstance(games, list) or not games:
+        raise FutebolError('Estrutura JSON da CBF não reconhecida; tabela não foi considerada completa.')
+    rows = []
+    for game in games:
+        if not isinstance(game, dict):
+            raise FutebolError('Estrutura JSON da CBF não reconhecida.')
+        ref = game.get('reference') or game.get('ref_jogo') or game.get('id')
+        rnd = game.get('round') or game.get('rodada')
+        home = game.get('home_team') or game.get('mandante') or game.get('time_mandante')
+        away = game.get('away_team') or game.get('visitante') or game.get('time_visitante')
+        raw_date = game.get('date') or game.get('data')
+        raw_time = game.get('time') or game.get('horario')
+        if not all((ref, rnd, home, away, raw_date, raw_time)):
+            raise FutebolError('Campos essenciais ausentes na estrutura JSON da CBF.')
+        date_text = str(raw_date).replace('-', '/')
+        if re.match(r'^\d{4}/', date_text):
+            year, month, day = date_text.split('/')[:3]
+            date_text = f'{day}/{month}/{year}'
+        rows.append([f'Ref: {ref} Rodada: {rnd}', '', f'{home} x {away}', f'Data: {date_text} às {str(raw_time).replace(":", "h")}', str(game.get('broadcast') or game.get('transmissao') or '')])
     return rows
 
 def parse_match(row: list[str], config: dict[str, Any], source: SourceSnapshot) -> dict[str, Any]:
@@ -142,7 +221,8 @@ def parse_broadcasters(raw: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[str, Any]:
-    matches = [parse_match(row, config, source) for row in extract_rows(source.html_text)]
+    rows = extract_json_rows(source.html_text) if source.source_format == 'json' else extract_rows(source.html_text)
+    matches = [parse_match(row, config, source) for row in rows]
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for match in matches:
@@ -153,7 +233,7 @@ def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[s
         deduped.append(match)
     deduped.sort(key=lambda item: (item['round'], item['kickoff'], item['home_team'], item['away_team']))
     validate_matches(deduped)
-    return {'schema_version': 1, 'data_mode': 'fixture', 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'url': source.url, 'status': source.status, 'fetched_at': source.fetched_at, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'matches': deduped}
+    return {'schema_version': 1, 'data_mode': source.status, 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'source_url': source.url, 'url': source.url, 'status': source.status, 'source_format': source.source_format, 'fetched_at': source.fetched_at, 'captured_at': source.fetched_at, 'document_sha256': source.document_sha256, 'content_length': source.content_length, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'matches': deduped}
 
 def build_summary(matches: list[dict[str, Any]]) -> dict[str, int]:
     return {'total_matches': len(matches), 'scheduled_matches': sum((1 for match in matches if match.get('status') == 'scheduled')), 'unscheduled_matches': sum((1 for match in matches if match.get('status') == 'unscheduled'))}
@@ -188,7 +268,7 @@ def match_sort_key(match: dict[str, Any]) -> tuple[Any, ...]:
     return (int(match['round']), match.get('kickoff') or '9999-12-31T23:59:59-03:00', match['home_team'], match['away_team'])
 
 def normalized_path(config: dict[str, Any]) -> Path:
-    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_fixture.json"
+    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_{config.get('_data_mode', 'fixture')}.json"
 
 def write_normalized(config: dict[str, Any], data: dict[str, Any]) -> Path:
     ensure_dirs()
@@ -509,8 +589,10 @@ def capitalize_pt(value: str) -> str:
 
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
-    snapshot = fetch_fixture(config)
-    write_fixture_raw(snapshot)
+    config['_data_mode'] = args.source
+    snapshot = fetch_fixture(config) if args.source == 'fixture' else fetch_real(config)
+    if args.source == 'fixture':
+        write_fixture_raw(snapshot)
     data = normalize_snapshot(config, snapshot)
     path = write_normalized(config, data)
     print(f'JSON normalizado salvo em: {path}')
@@ -519,7 +601,8 @@ def cmd_normalize(args: argparse.Namespace) -> int:
 
 def cmd_preview(args: argparse.Namespace) -> int:
     config = load_config()
-    data = normalize_snapshot(config, fetch_fixture(config))
+    config['_data_mode'] = args.source
+    data = normalize_snapshot(config, fetch_fixture(config) if args.source == 'fixture' else fetch_real(config))
     if args.date or args.today:
         selected_date = local_today(config) if args.today else args.date
         print(render_daily_preview(config, data, selected_date, today=args.today))
@@ -531,7 +614,8 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     if not args.dry_run:
         raise FutebolError('--dry-run é obrigatório para alertas nesta missão.')
     config = load_config()
-    data = normalize_snapshot(config, fetch_fixture(config))
+    config['_data_mode'] = args.source
+    data = normalize_snapshot(config, fetch_fixture(config) if args.source == 'fixture' else fetch_real(config))
     generated_at = now_iso(config['timezone'])
     alerts = build_alerts(config, data, round_number=args.round, current=args.current, generated_at=generated_at)
     if not alerts:
@@ -554,8 +638,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
     subparsers = parser.add_subparsers(dest='command', required=True)
     normalize_parser = subparsers.add_parser('normalize')
+    normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
     preview_parser = subparsers.add_parser('preview')
+    preview_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     preview_group = preview_parser.add_mutually_exclusive_group()
     preview_group.add_argument('--round', type=int)
     preview_group.add_argument('--current', action='store_true')
@@ -563,6 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     preview_group.add_argument('--today', action='store_true')
     preview_parser.set_defaults(func=cmd_preview)
     alerts_parser = subparsers.add_parser('alerts')
+    alerts_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     alerts_group = alerts_parser.add_mutually_exclusive_group(required=True)
     alerts_group.add_argument('--round', type=int)
     alerts_group.add_argument('--current', action='store_true')

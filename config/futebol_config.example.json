@@ -4,7 +4,11 @@
   "owner_team": "Flamengo",
   "timezone": "America/Sao_Paulo",
   "source": {
-    "provider": "CBF"
+    "provider": "CBF",
+    "mode": "fixture",
+    "official_url": "https://www.cbf.com.br/futebol-brasileiro/tabelas/campeonato-brasileiro/serie-a/2026?doc=Tabela%20Detalhada",
+    "timeout_seconds": 20,
+    "max_download_bytes": 5000000
   },
   "alerts": {
     "round_overview": {

@@ -4,7 +4,7 @@ Projeto independente do Orion para ler uma tabela de futebol, normalizar partida
 
 ## Funcionalidades atuais
 
-- leitura de fixture HTML local;
+- leitura de fixture HTML local e fonte oficial CBF em modo `real`;
 - normalização de partidas, rodada, horário, local e transmissão;
 - seleção de rodada e do time favorito;
 - preview textual;
@@ -31,22 +31,22 @@ Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo G
 
 ## CLI local
 
-Esta versão usa exclusivamente a fixture HTML sintética incluída no repositório. Ainda não acessa a CBF real, não envia WhatsApp e não integra OpenClaw. Os alertas são somente dados em dry-run.
+`fixture` é o padrão seguro, offline e determinístico. `real` acessa somente a URL HTTPS oficial configurada da CBF, aplica timeout, limite de download, validação HTTP/conteúdo e registra URL, captura, formato, tamanho e SHA-256. A estrutura da CBF pode mudar; nesse caso a execução falha sem gerar tabela parcial.
 
 ```bash
-PYTHONPATH=src python3 -m orion_football.futebol normalize
-PYTHONPATH=src python3 -m orion_football.futebol preview --round 19
-PYTHONPATH=src python3 -m orion_football.futebol preview --current
-PYTHONPATH=src python3 -m orion_football.futebol preview --date 2026-07-16
-PYTHONPATH=src python3 -m orion_football.futebol preview --today
-PYTHONPATH=src python3 -m orion_football.futebol alerts --round 19 --dry-run
-PYTHONPATH=src python3 -m orion_football.futebol alerts --current --dry-run
+PYTHONPATH=src python3 -m orion_football.futebol normalize --source fixture
+PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --round 19
+PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --date 2026-07-16
+PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --today
+PYTHONPATH=src python3 -m orion_football.futebol alerts --source fixture --round 19 --dry-run
+PYTHONPATH=src python3 -m orion_football.futebol normalize --source real
+PYTHONPATH=src python3 -m orion_football.futebol preview --source real --current
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Limitações
 
-Não há fonte CBF real, envio de WhatsApp, OpenClaw, agendamento, retry ou instalação. A fixture é sintética e os alertas permanecem em dry-run.
+Não há envio de WhatsApp, OpenClaw, agendamento, retry automático ou instalador. Alertas permanecem exclusivamente em dry-run. Campos ausentes na fonte aparecem vazios ou como “ainda não informado”; não são inventados. A fonte real depende do contrato público atual da CBF e pode exigir atualização do parser.
 
 ## Segurança e privacidade
 
@@ -54,4 +54,4 @@ Nenhuma credencial, token, telefone, ledger operacional, estado, log ou document
 
 ## Roadmap
 
-1. adicionar adaptadores de fonte com contratos testáveis; 2. documentar uma interface de entrega abstrata; 3. ampliar fixtures e validações sem incluir dados pessoais.
+1. acompanhar mudanças no formato oficial da CBF; 2. manter fixtures e validações offline; 3. definir posteriormente uma entrega, em missão separada.
