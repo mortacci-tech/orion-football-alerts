@@ -24,5 +24,28 @@ class FutebolTests(unittest.TestCase):
     def test_sem_internet(self):
         c,d=self.data();
         with patch("orion_football.futebol.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
+    def test_preview_data_com_multiplos_jogos_e_ordem(self):
+        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16")
+        self.assertIn("19h30 — Botafogo x Santos",p)
+        self.assertIn("19h30 — Vitória x Vasco da Gama",p)
+        self.assertLess(p.index("Botafogo"),p.index("Vitória"))
+        self.assertNotIn("Fonte: CBF",p)
+    def test_preview_destaca_favorito(self):
+        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23")
+        self.assertTrue(p.startswith("🔴⚫ HOJE TEM FLAMENGO"))
+        self.assertIn("20h00 — Flamengo x Botafogo",p)
+        self.assertIn("📍 Maracanã — Rio de Janeiro/RJ",p)
+        self.assertIn("📺 Globo, Premiere",p)
+    def test_preview_data_sem_jogos(self):
+        c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ NÃO HÁ JOGOS EM 22/07/2026")
+    def test_data_invalida(self):
+        with self.assertRaises(futebol.FutebolError): futebol.parse_schedule_date("22/07/2026")
+    def test_today_com_relogio_injetado(self):
+        c,d=self.data(); now=datetime.fromisoformat("2026-07-23T01:00:00+00:00")
+        self.assertEqual(futebol.local_today(c, now), datetime.fromisoformat("2026-07-22T22:00:00-03:00").date())
+    def test_preview_sem_local_ou_transmissao(self):
+        c,d=self.data(); d=copy.deepcopy(d); match=d["matches"][0]; match["venue"]=""; match["city"]=""; match["state"]=""; match["broadcasters"]=[]
+        p=futebol.render_daily_preview(c,d,"2026-07-16")
+        self.assertNotIn("📍",p); self.assertNotIn("📺",p)
 
 if __name__ == "__main__": unittest.main()

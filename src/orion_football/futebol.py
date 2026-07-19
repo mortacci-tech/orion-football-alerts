@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -16,6 +16,11 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent.parent
+RAW_DIR = PROJECT_DIR / 'data' / 'raw'
+NORMALIZED_DIR = PROJECT_DIR / 'data' / 'normalized'
+STATE_DIR = PROJECT_DIR / 'state'
+ALERTS_DIR = STATE_DIR
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
 ALERT_LEDGER_PATH = BASE_DIR.parent.parent / 'state' / 'alerts.json'
@@ -286,6 +291,52 @@ def render_preview(data: dict[str, Any], round_number: int | None=None, current:
         lines.append(render_broadcast(match))
     return '\n'.join(lines).strip()
 
+def parse_schedule_date(value: str) -> date:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise FutebolError(f'Data inválida: {value}. Use o formato YYYY-MM-DD.') from exc
+    if parsed.isoformat() != value:
+        raise FutebolError(f'Data inválida: {value}. Use o formato YYYY-MM-DD.')
+    return parsed
+
+def select_matches_by_date(data: dict[str, Any], selected_date: date | str) -> list[dict[str, Any]]:
+    target = parse_schedule_date(selected_date) if isinstance(selected_date, str) else selected_date
+    matches = [match for match in data['matches'] if match.get('status') == 'scheduled' and match.get('schedule_date') == target.isoformat()]
+    return sorted(matches, key=lambda match: (match.get('schedule_time', ''), match['home_team'], match['away_team']))
+
+def local_today(config: dict[str, Any], now: datetime | None = None) -> date:
+    timezone = ZoneInfo(config['timezone'])
+    current = now.astimezone(timezone) if now else datetime.now(timezone)
+    return current.date()
+
+def render_daily_preview(config: dict[str, Any], data: dict[str, Any], selected_date: date | str) -> str:
+    target = parse_schedule_date(selected_date) if isinstance(selected_date, str) else selected_date
+    matches = select_matches_by_date(data, target)
+    if not matches:
+        return f'⚽ NÃO HÁ JOGOS EM {target:%d/%m/%Y}'
+    owner = config['owner_team']
+    owner_matches = [match for match in matches if owner.casefold() in {match['home_team'].casefold(), match['away_team'].casefold()}]
+    lines = [f'🔴⚫ HOJE TEM {owner.upper()}' if owner_matches else '⚽ JOGOS DE HOJE', '']
+    selected = owner_matches + [match for match in matches if match not in owner_matches]
+    if owner_matches:
+        selected_owner = owner_matches[0]
+        lines.append(f"{selected_owner['schedule_time'].replace(':', 'h')} — {selected_owner['home_team']} x {selected_owner['away_team']}")
+        location = render_location(selected_owner)
+        if location:
+            lines.append(f'📍 {location}')
+        if selected_owner.get('broadcasters'):
+            lines.append(f"📺 {', '.join(selected_owner['broadcasters'])}")
+        others = [match for match in matches if match not in owner_matches]
+        if others:
+            lines.extend(['', '⚽ OUTROS JOGOS', ''])
+            selected = others
+        else:
+            selected = []
+    for match in selected:
+        lines.append(f"{match['schedule_time'].replace(':', 'h')} — {match['home_team']} x {match['away_team']}")
+    return '\n'.join(lines).strip()
+
 def select_round(data: dict[str, Any], round_number: int | None=None, current: bool=False) -> int:
     if current:
         return choose_current_round(data['matches'], data['timezone'])
@@ -461,6 +512,12 @@ def render_location(match: dict[str, Any]) -> str:
 def capitalize_pt(value: str) -> str:
     return value[:1].upper() + value[1:].lower()
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    raise FutebolError('Download automático não está habilitado nesta missão; use a fixture local.')
+
+def cmd_send(args: argparse.Namespace) -> int:
+    raise FutebolError('Envio não está habilitado nesta missão.')
+
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
     if args.source == 'fixture':
@@ -477,8 +534,18 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     return 0
 
 def cmd_preview(args: argparse.Namespace) -> int:
-    data = load_normalized(load_config(), args.source)
-    print(render_preview(data, round_number=args.round, current=args.current))
+    config = load_config()
+    try:
+        data = load_normalized(config, args.source)
+    except FutebolError:
+        if args.source != 'fixture':
+            raise
+        data = normalize_snapshot(config, fetch_fixture(config))
+    if args.date or args.today:
+        selected_date = local_today(config) if args.today else args.date
+        print(render_daily_preview(config, data, selected_date))
+    else:
+        print(render_preview(data, round_number=args.round, current=args.current))
     return 0
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -536,6 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
     preview_group = preview_parser.add_mutually_exclusive_group()
     preview_group.add_argument('--round', type=int)
     preview_group.add_argument('--current', action='store_true')
+    preview_group.add_argument('--date', type=parse_schedule_date)
+    preview_group.add_argument('--today', action='store_true')
     preview_parser.set_defaults(func=cmd_preview)
     run_parser = subparsers.add_parser('run')
     run_parser.add_argument('--source', choices=['fixture', 'real'], required=True)
@@ -560,11 +629,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 def main(argv: list[str] | None=None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
     try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
         return args.func(args)
-    except FutebolError as exc:
+    except (FutebolError, ValueError) as exc:
         print(f'ERRO: {exc}', file=sys.stderr)
         return 2
 if __name__ == '__main__':
