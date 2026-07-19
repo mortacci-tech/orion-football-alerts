@@ -1,0 +1,16 @@
+.DS_Store
+**pycache**/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+data/
+state/
+ledgers/
+downloads/
+*.pdf
+*_real.json
+*_ledger.json
+secrets/

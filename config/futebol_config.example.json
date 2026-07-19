@@ -1,0 +1,9 @@
+{
+  "competition": "campeonato_brasileiro_serie_a",
+  "season": 2026,
+  "owner_team": "Flamengo",
+  "timezone": "America/Sao_Paulo",
+  "source": {
+    "provider": "CBF"
+  }
+}
