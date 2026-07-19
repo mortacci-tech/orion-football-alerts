@@ -29,16 +29,24 @@ pip install -r requirements.txt
 
 Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo Git e ajuste a fonte conforme os termos do provedor. A primeira versão pública usa fixture; nenhuma credencial é necessária.
 
-## Comandos usando fixture
+## CLI local
+
+Esta versão usa exclusivamente a fixture HTML sintética incluída no repositório. Ainda não acessa a CBF real, não envia WhatsApp e não integra OpenClaw. Os alertas são somente dados em dry-run.
 
 ```bash
-PYTHONPATH=src python3 -c 'from orion_football import futebol; c=futebol.load_config(); d=futebol.normalize_snapshot(c, futebol.fetch_fixture(c)); print(futebol.render_preview(d, round_number=19))'
+PYTHONPATH=src python3 -m orion_football.futebol normalize
+PYTHONPATH=src python3 -m orion_football.futebol preview --round 19
+PYTHONPATH=src python3 -m orion_football.futebol preview --current
+PYTHONPATH=src python3 -m orion_football.futebol preview --date 2026-07-16
+PYTHONPATH=src python3 -m orion_football.futebol preview --today
+PYTHONPATH=src python3 -m orion_football.futebol alerts --round 19 --dry-run
+PYTHONPATH=src python3 -m orion_football.futebol alerts --current --dry-run
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Limitações
 
-Não há download automático, sender real, agendamento, retry ou integração com o Orion. Fontes externas podem mudar; o usuário deve respeitar os termos de uso da fonte.
+Não há fonte CBF real, envio de WhatsApp, OpenClaw, agendamento, retry ou instalação. A fixture é sintética e os alertas permanecem em dry-run.
 
 ## Segurança e privacidade
 

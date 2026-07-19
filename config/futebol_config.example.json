@@ -5,5 +5,13 @@
   "timezone": "America/Sao_Paulo",
   "source": {
     "provider": "CBF"
+  },
+  "alerts": {
+    "round_overview": {
+      "enabled": true
+    },
+    "owner_team_round": {
+      "enabled": true
+    }
   }
 }

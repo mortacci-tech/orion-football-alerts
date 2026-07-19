@@ -1,8 +1,10 @@
 import copy
+import io
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from orion_football import futebol
 
@@ -23,7 +25,7 @@ class FutebolTests(unittest.TestCase):
             p=Path(x)/"ledger.json"; _,n,e=futebol.update_alert_ledger(a,"2026-07-17T00:00:00-03:00",p); _,n2,e2=futebol.update_alert_ledger(a,"2026-07-17T01:00:00-03:00",p); self.assertEqual((n,e,n2,e2),(2,0,0,2))
     def test_sem_internet(self):
         c,d=self.data();
-        with patch("orion_football.futebol.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
+        with patch("urllib.request.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
     def test_preview_data_com_multiplos_jogos_e_ordem(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16")
         self.assertIn("⚽ JOGOS DE 16/07/2026",p)
@@ -52,5 +54,100 @@ class FutebolTests(unittest.TestCase):
     def test_preview_today_usa_hoje(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
         self.assertTrue(p.startswith("🔴⚫ HOJE TEM FLAMENGO"))
+
+    def run_cli(self, *argv):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            try:
+                code = futebol.main(list(argv))
+            except SystemExit as exc:
+                code = exc.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_parser_cria_cli_sem_erro(self):
+        parser = futebol.build_parser()
+        self.assertIsNotNone(parser)
+        self.assertEqual(parser.parse_args(["normalize"]).command, "normalize")
+
+    def test_comando_fetch_nao_existe(self):
+        code, _, error = self.run_cli("fetch")
+        self.assertNotEqual(code, 0)
+        self.assertIn("invalid choice", error)
+
+    def test_comando_send_nao_existe(self):
+        code, _, error = self.run_cli("send")
+        self.assertNotEqual(code, 0)
+        self.assertIn("invalid choice", error)
+
+    def test_source_real_nao_aceito(self):
+        code, _, error = self.run_cli("normalize", "--source", "real")
+        self.assertNotEqual(code, 0)
+        self.assertIn("unrecognized arguments", error)
+
+    def test_cli_normalize_funciona(self):
+        code, output, error = self.run_cli("normalize")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("JSON normalizado salvo em:", output)
+
+    def test_cli_preview_round_funciona(self):
+        code, output, error = self.run_cli("preview", "--round", "19")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("RODADA 19", output)
+
+    def test_cli_preview_current_funciona(self):
+        code, output, error = self.run_cli("preview", "--current")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("RODADA", output)
+
+    def test_cli_preview_date_funciona(self):
+        code, output, error = self.run_cli("preview", "--date", "2026-07-16")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("JOGOS DE 16/07/2026", output)
+
+    def test_cli_preview_today_funciona_com_relogio_controlado(self):
+        c, d = self.data()
+        with patch.object(futebol, "local_today", return_value=datetime.fromisoformat("2026-07-23T00:00:00-03:00").date()):
+            code, output, error = self.run_cli("preview", "--today")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("HOJE TEM FLAMENGO", output)
+
+    def test_cli_alerts_round_dry_run_funciona(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(futebol, "ALERT_LEDGER_PATH", root / "alerts.json"), patch.object(futebol, "ALERTS_PLAN_PATH", root / "plan.json"), patch.object(futebol, "ALERTS_PREVIEW_PATH", root / "preview.txt"):
+                code, output, error = self.run_cli("alerts", "--round", "19", "--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("Alertas gerados: 2", output)
+
+    def test_cli_alerts_current_dry_run_funciona(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(futebol, "ALERT_LEDGER_PATH", root / "alerts.json"), patch.object(futebol, "ALERTS_PLAN_PATH", root / "plan.json"), patch.object(futebol, "ALERTS_PREVIEW_PATH", root / "preview.txt"):
+                code, output, error = self.run_cli("alerts", "--current", "--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("Alertas gerados: 2", output)
+
+    def test_execucao_local_nao_chama_rede_nem_subprocesso(self):
+        with patch("urllib.request.urlopen") as urlopen, patch("subprocess.run") as run, patch("subprocess.Popen") as popen:
+            code, _, error = self.run_cli("preview", "--round", "19")
+        self.assertEqual((code, error), (0, ""))
+        urlopen.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_time_favorito_nao_fica_fixo_em_flamengo(self):
+        c, d = self.data()
+        c["owner_team"] = "Botafogo"
+        message = futebol.render_whatsapp_owner_team_message(c, d, 19)
+        self.assertIn("PRÓXIMO JOGO DO BOTAFOGO", message)
+        self.assertNotIn("PRÓXIMO JOGO DO FLAMENGO", message)
+
+    def test_comandos_invalidos_retornam_erro_claro(self):
+        for argv in (("preview", "--round"), ("preview", "--date", "16/07/2026"), ("alerts", "--round", "19")):
+            with self.subTest(argv=argv):
+                code, _, error = self.run_cli(*argv)
+                self.assertNotEqual(code, 0)
+                self.assertTrue(error.startswith("usage:") or "obrigatório" in error or "invalid" in error or "Data inválida" in error)
 
 if __name__ == "__main__": unittest.main()
