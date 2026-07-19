@@ -582,7 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest='command', required=True)
     fetch_parser = subparsers.add_parser('fetch')
     fetch_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
-    fetch_parser.set_defaults(func=lambda _args: (_ for _ in ()).throw(FutebolError('Download automático não está habilitado nesta missão; use a fixture local.')))
+    fetch_parser.set_defaults(func=cmd_fetch)
     normalize_parser = subparsers.add_parser('normalize')
     normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
@@ -613,7 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument('--alert-type', choices=['round_overview', 'owner_team_round'], required=True)
     send_parser.add_argument('--self-only', action='store_true', required=True)
     send_parser.add_argument('--confirm', required=True)
-    send_parser.set_defaults(func=lambda _args: (_ for _ in ()).throw(FutebolError('Envio não está habilitado nesta missão.')))
+    send_parser.set_defaults(func=cmd_send)
     return parser
 
 def main(argv: list[str] | None=None) -> int:
