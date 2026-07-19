@@ -9,5 +9,14 @@ description = "Alertas determinísticos de futebol"
 requires-python = ">=3.11"
 dependencies = ["pypdf==6.12.1"]
 
+[project.scripts]
+orion-football = "orion_football.futebol:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+orion_football = ["fixtures/*.html", "fixtures/*.txt", "config/*.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]

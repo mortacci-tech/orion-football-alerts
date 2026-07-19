@@ -28,33 +28,31 @@ Python 3.11+ é recomendado. A dependência de extração é `pypdf==6.12.1`.
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
+
+O pacote instala o comando `orion-football`. Para o passo a passo no macOS, consulte [docs/INSTALL-MACOS.md](docs/INSTALL-MACOS.md).
 
 ## Configuração
 
-Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo Git. Não há token, telefone ou credencial necessária. Mudanças no artigo ou no layout do PDF podem exigir atualização do parser; a execução falha claramente quando não consegue validar os dados e nunca inventa datas, horários, locais ou transmissões ausentes.
+Crie a configuração pessoal com `orion-football init --owner-team Flamengo --timezone America/Sao_Paulo --season 2026` e valide com `orion-football doctor`. O padrão é `~/Library/Application Support/Orion Football/config.json`; os dados ficam em `~/Library/Application Support/Orion Football/data/`. Não há token, telefone ou credencial necessária.
 
 ## CLI local
 
 `fixture` é o padrão seguro, offline e determinístico. `real` acessa somente a URL HTTPS oficial configurada da CBF, aplica timeout, limite de download, validação HTTP/conteúdo e registra URL, captura, formato, tamanho e SHA-256. A estrutura da CBF pode mudar; nesse caso a execução falha sem gerar tabela parcial.
 
 ```bash
-PYTHONPATH=src python3 -m orion_football.futebol normalize --source fixture
-PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --round 19
-PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --date 2026-07-16
-PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --today
-PYTHONPATH=src python3 -m orion_football.futebol alerts --source fixture --round 19 --dry-run
-PYTHONPATH=src python3 -m orion_football.futebol normalize --source real
-PYTHONPATH=src python3 -m orion_football.futebol preview --source real --round 19
-PYTHONPATH=src python3 -m orion_football.futebol preview --source real --date 2026-07-16
-PYTHONPATH=src python3 -m orion_football.futebol preview --source real --today
-PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
+orion-football --help
+orion-football normalize --source fixture
+orion-football preview --source fixture --round 19
+orion-football alerts --source fixture --round 19 --dry-run
+python3 -m orion_football.futebol preview --source fixture --round 19
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Limitações
 
-Não há WhatsApp, OpenClaw, agendamento, retry automático ou instalador. Alertas permanecem exclusivamente em dry-run. Campos ausentes aparecem vazios ou como “ainda não informado”; não são inventados. O JSON normalizado real contém artigo, documento, hash, bytes, páginas, rodadas e partidas.
+Não há WhatsApp, OpenClaw, agendamento, retry automático, LaunchAgent ou instalador automático. Alertas permanecem exclusivamente em dry-run. O produto ainda não está pronto para o público. Campos ausentes aparecem vazios ou como “ainda não informado”; não são inventados.
 
 ## Segurança e privacidade
 

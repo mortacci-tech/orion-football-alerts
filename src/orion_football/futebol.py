@@ -6,7 +6,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
+from importlib import resources
 import urllib.error
 import urllib.request
 from urllib.parse import urljoin, urlparse
@@ -29,6 +31,8 @@ STATE_DIR = ALERTS_DIR
 ALERT_LEDGER_PATH = BASE_DIR.parent.parent / 'state' / 'alerts.json'
 ALERTS_PLAN_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_plan.json'
 ALERTS_PREVIEW_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_preview.txt'
+DEFAULT_CONFIG_PATH = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'config.json'
+DEFAULT_DATA_DIR = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data'
 BROADCASTERS_BY_COLUMN = {'1': 'Globo', '2': 'Record', '3': 'Sportv', '4': 'Amazon', '5': 'Youtube / Cazé TV', '6': 'GE TV', '7': 'Premiere'}
 MONTHS_PT = {1: 'JANEIRO', 2: 'FEVEREIRO', 3: 'MARCO', 4: 'ABRIL', 5: 'MAIO', 6: 'JUNHO', 7: 'JULHO', 8: 'AGOSTO', 9: 'SETEMBRO', 10: 'OUTUBRO', 11: 'NOVEMBRO', 12: 'DEZEMBRO'}
 WEEKDAYS_PT = {0: 'SEGUNDA-FEIRA', 1: 'TERCA-FEIRA', 2: 'QUARTA-FEIRA', 3: 'QUINTA-FEIRA', 4: 'SEXTA-FEIRA', 5: 'SABADO', 6: 'DOMINGO'}
@@ -52,10 +56,88 @@ class SourceSnapshot:
     page_count: int = 0
     pages: tuple[str, ...] = ()
 
-def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise FutebolError(f'Configuração não encontrada: {CONFIG_PATH}')
-    return json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+def resolve_config_path(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    if os.environ.get('ORION_FOOTBALL_CONFIG'):
+        return Path(os.environ['ORION_FOOTBALL_CONFIG']).expanduser()
+    return Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'config.json'
+
+def configure_paths(config: dict[str, Any]) -> None:
+    global DATA_DIR, RAW_DIR, NORMALIZED_DIR, ALERTS_DIR, STATE_DIR
+    global ALERT_LEDGER_PATH, ALERTS_PLAN_PATH, ALERTS_PREVIEW_PATH
+    data_dir = Path(config.get('data_dir') or (Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data')).expanduser()
+    DATA_DIR = data_dir
+    RAW_DIR = data_dir / 'raw'
+    NORMALIZED_DIR = data_dir / 'normalized'
+    STATE_DIR = data_dir / 'state'
+    ALERTS_DIR = STATE_DIR
+    ALERT_LEDGER_PATH = STATE_DIR / 'alerts.json'
+    ALERTS_PLAN_PATH = STATE_DIR / 'alerts_plan.json'
+    ALERTS_PREVIEW_PATH = STATE_DIR / 'alerts_preview.txt'
+
+def validate_config(config: dict[str, Any]) -> None:
+    if config.get('schema_version') != 1:
+        raise FutebolError('schema_version deve ser 1.')
+    if not str(config.get('owner_team', '')).strip():
+        raise FutebolError('owner_team não pode ser vazio.')
+    try:
+        season = int(config.get('season'))
+    except (TypeError, ValueError) as exc:
+        raise FutebolError('season deve ser um ano válido.') from exc
+    if season < 1900 or season > 2100:
+        raise FutebolError('season deve estar entre 1900 e 2100.')
+    try:
+        ZoneInfo(config.get('timezone', ''))
+    except Exception as exc:
+        raise FutebolError(f'timezone inválido: {config.get("timezone")}') from exc
+    source = config.get('source') or {}
+    if source.get('mode', 'fixture') not in {'fixture', 'real'}:
+        raise FutebolError('source.mode deve ser fixture ou real.')
+    for key in ('article_url', 'document_url'):
+        approved_url(source.get(key, ''), document=key == 'document_url')
+
+def load_config(path: str | Path | None = None, *, require: bool = False) -> dict[str, Any]:
+    config_path = resolve_config_path(path)
+    if not config_path.exists():
+        if require:
+            raise FutebolError(f'Configuração não encontrada: {config_path}')
+        # Compatibilidade do módulo no checkout: somente configuração fixture segura.
+        if CONFIG_PATH.exists():
+            config = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+            config['source'] = {**config.get('source', {}), 'mode': 'fixture'}
+            return config
+        raise FutebolError(f'Configuração não encontrada: {config_path}')
+    try:
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FutebolError(f'Configuração inválida: {config_path}') from exc
+    validate_config(config)
+    configure_paths(config)
+    return config
+
+def config_template(owner_team: str, timezone: str, season: int) -> dict[str, Any]:
+    try:
+        template_path = resources.files('orion_football').joinpath('config', 'futebol_config.example.json')
+        template = json.loads(template_path.read_text(encoding='utf-8'))
+    except (FileNotFoundError, TypeError):
+        template = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+    template['schema_version'] = 1
+    template['owner_team'] = owner_team
+    template['timezone'] = timezone
+    template['season'] = season
+    template['data_dir'] = str(Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data')
+    template['source']['mode'] = 'fixture'
+    return template
+
+def fixture_path(name: str) -> Path:
+    try:
+        resource = resources.files('orion_football').joinpath('fixtures', name)
+        if resource.is_file():
+            return Path(resource)
+    except (FileNotFoundError, TypeError):
+        pass
+    return BASE_DIR.parent.parent / 'fixtures' / name
 
 def ensure_dirs() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,11 +151,12 @@ def now_iso(tz_name: str) -> str:
     return datetime.now(ZoneInfo(tz_name)).isoformat(timespec='seconds')
 
 def fetch_fixture(config: dict[str, Any]) -> SourceSnapshot:
-    if not FIXTURE_PATH.exists():
-        raise FutebolError(f'Fixture não encontrada: {FIXTURE_PATH}')
+    path = fixture_path('cbf_tabela_detalhada_sample.html')
+    if not path.exists():
+        raise FutebolError(f'Fixture não encontrada: {path}')
     tz_name = config['timezone']
-    text = FIXTURE_PATH.read_text(encoding='utf-8')
-    return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=text, raw_path=None, source_format='html', document_sha256=hashlib.sha256(text.encode()).hexdigest(), content_length=len(text.encode()))
+    text = path.read_text(encoding='utf-8')
+    return SourceSnapshot(provider='CBF', url=str(path), status='fixture', fetched_at=now_iso(tz_name), html_text=text, raw_path=None, source_format='html', document_sha256=hashlib.sha256(text.encode()).hexdigest(), content_length=len(text.encode()))
 
 ALLOWED_HOSTS = {'cbf.com.br', 'www.cbf.com.br', 'stcbfsiteprdimgbrs.blob.core.windows.net'}
 
@@ -714,6 +797,77 @@ def render_location(match: dict[str, Any]) -> str:
 def capitalize_pt(value: str) -> str:
     return value[:1].upper() + value[1:].lower()
 
+def cmd_init(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
+    try:
+        timezone = ZoneInfo(args.timezone)
+    except Exception as exc:
+        raise FutebolError(f'timezone inválido: {args.timezone}') from exc
+    if not args.owner_team.strip():
+        raise FutebolError('owner_team não pode ser vazio.')
+    if args.season < 1900 or args.season > 2100:
+        raise FutebolError('season deve estar entre 1900 e 2100.')
+    if path.exists() and not args.force:
+        raise FutebolError(f'Configuração já existe: {path}. Use --force para substituir.')
+    config = config_template(args.owner_team.strip(), str(timezone.key), args.season)
+    validate_config(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_name(f'{path.name}.{datetime.now().strftime("%Y%m%d-%H%M%S")}.bak')
+        shutil.copy2(path, backup)
+        print(f'Backup salvo em: {backup}')
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    configure_paths(config)
+    for directory in (DATA_DIR, RAW_DIR, NORMALIZED_DIR, STATE_DIR, DATA_DIR / 'backups'):
+        directory.mkdir(parents=True, exist_ok=True)
+    print(f'Configuração criada em: {path}')
+    print(f'Dados serão armazenados em: {DATA_DIR}')
+    return 0
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config)
+    errors = 0
+    def result(status: str, message: str) -> None:
+        print(f'{status}: {message}')
+    if sys.version_info >= (3, 11):
+        result('OK', f'Python {sys.version_info.major}.{sys.version_info.minor}')
+    else:
+        result('ERRO', 'Python 3.11 ou superior é necessário')
+        errors += 1
+    try:
+        import pypdf  # noqa: F401
+        result('OK', 'pypdf importado')
+    except ImportError:
+        result('ERRO', 'pypdf não está instalado')
+        errors += 1
+    try:
+        config = load_config(path, require=True)
+        result('OK', f'configuração legível: {path}')
+        result('OK', f'schema_version: {config["schema_version"]}')
+        result('OK', f'time favorito: {config["owner_team"]}')
+        result('OK', f'timezone: {config["timezone"]}')
+        result('OK', f'temporada: {config["season"]}')
+        result('OK', f'modo da fonte: {config["source"]["mode"]}')
+        result('OK', 'URLs HTTPS e hosts oficiais aprovados')
+        configure_paths(config)
+        if os.access(DATA_DIR.parent, os.W_OK) or DATA_DIR.exists():
+            result('OK', f'diretório de dados: {DATA_DIR}')
+        else:
+            result('ERRO', f'diretório de dados sem permissão: {DATA_DIR}')
+            errors += 1
+        fixture = fixture_path('cbf_tabela_detalhada_sample.html')
+        if fixture.is_file() and os.access(fixture, os.R_OK):
+            result('OK', f'fixture offline: {fixture}')
+        else:
+            result('ERRO', 'fixture offline não encontrada ou ilegível')
+            errors += 1
+        result('OK', 'sem destino WhatsApp e sem integração OpenClaw')
+        result('OK', 'diagnóstico offline; nenhuma rede acessada')
+    except FutebolError as exc:
+        result('ERRO', str(exc))
+        errors += 1
+    return 1 if errors else 0
+
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
     config['_data_mode'] = args.source
@@ -763,7 +917,16 @@ def cmd_alerts(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
+    parser.add_argument('--config', help='caminho da configuração local')
     subparsers = parser.add_subparsers(dest='command', required=True)
+    init_parser = subparsers.add_parser('init')
+    init_parser.add_argument('--owner-team', default='Flamengo')
+    init_parser.add_argument('--timezone', default='America/Sao_Paulo')
+    init_parser.add_argument('--season', type=int, default=2026)
+    init_parser.add_argument('--force', action='store_true')
+    init_parser.set_defaults(func=cmd_init)
+    doctor_parser = subparsers.add_parser('doctor')
+    doctor_parser.set_defaults(func=cmd_doctor)
     normalize_parser = subparsers.add_parser('normalize')
     normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
@@ -788,6 +951,9 @@ def main(argv: list[str] | None=None) -> int:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
+        if args.command not in {'init', 'doctor'}:
+            # O argumento global é resolvido uma única vez para todos os comandos.
+            load_config(args.config)
         return args.func(args)
     except (FutebolError, ValueError) as exc:
         print(f'ERRO: {exc}', file=sys.stderr)
