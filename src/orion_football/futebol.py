@@ -55,6 +55,7 @@ class SourceSnapshot:
     content_type: str = ''
     page_count: int = 0
     pages: tuple[str, ...] = ()
+    article_fallback_reason: str = ''
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path:
     if explicit:
@@ -198,6 +199,8 @@ def _download(url: str, config: dict[str, Any], accept: str) -> tuple[bytes, Any
             return b''.join(chunks), response, status
     except urllib.error.HTTPError as exc:
         raise FutebolError(f'Fonte CBF respondeu HTTP {exc.code}.') from exc
+    except TimeoutError as exc:
+        raise FutebolError(f'Tempo esgotado ao acessar a fonte CBF: {exc}.') from exc
     except urllib.error.URLError as exc:
         raise FutebolError(f'Falha ao acessar a fonte CBF: {exc.reason}.') from exc
 
@@ -224,11 +227,11 @@ def locate_document_url(config: dict[str, Any], article_html: str | None = None)
         fallback = sc.get('document_url') or REAL_DOCUMENT_DEFAULT
         return approved_url(fallback, document=True)
 
-def fetch_real(config: dict[str, Any]) -> SourceSnapshot:
-    article_url = approved_url(source_config(config).get('article_url') or REAL_URL_DEFAULT)
-    article_body, article_response, status = _download(article_url, config, 'text/html')
-    document_url = locate_document_url(config, article_body.decode('utf-8', errors='replace'))
-    body, response, status = _download(document_url, config, 'application/pdf')
+def summarize_article_failure(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    return re.sub(r'\s+', ' ', message)[:300]
+
+def validate_pdf_response(body: bytes, response: Any) -> tuple[str, str]:
     if not body:
         raise FutebolError('Resposta vazia: PDF da CBF vazio.')
     content_type = response.headers.get('Content-Type', '')
@@ -237,18 +240,54 @@ def fetch_real(config: dict[str, Any]) -> SourceSnapshot:
         raise FutebolError(f'Resposta da CBF não é PDF (Content-Type: {content_type or "ausente"}).')
     if not body.startswith(b'%PDF'):
         raise FutebolError('Resposta declarada como PDF, mas não possui assinatura %PDF.')
+    return content_type, content_main
+
+def fetch_real(config: dict[str, Any]) -> SourceSnapshot:
+    sc = source_config(config)
+    article_url = approved_url(sc.get('article_url') or REAL_URL_DEFAULT)
+    fallback_url = approved_url(sc.get('document_url') or REAL_DOCUMENT_DEFAULT, document=True)
+    article_fallback_reason = ''
+    try:
+        article_body, _, _ = _download(article_url, config, 'text/html')
+        document_url = discover_document_url(article_body.decode('utf-8', errors='replace'), config, article_url)
+    except Exception as exc:
+        article_fallback_reason = summarize_article_failure(exc)
+        document_url = fallback_url
+        try:
+            body, response, status = _download(document_url, config, 'application/pdf')
+            content_type, content_main = validate_pdf_response(body, response)
+        except Exception as pdf_exc:
+            raise FutebolError(
+                f'Falha no artigo CBF; motivo: {article_fallback_reason}. '
+                f'Falha no document_url oficial {document_url}; motivo: {summarize_article_failure(pdf_exc)}.'
+            ) from pdf_exc
+    else:
+        body, response, status = _download(document_url, config, 'application/pdf')
+        content_type, content_main = validate_pdf_response(body, response)
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(body))
         pages = tuple((page.extract_text() or '') for page in reader.pages)
     except Exception as exc:
-        raise FutebolError(f'PDF da CBF corrompido ou ilegível: {exc}') from exc
+        document_error = f'PDF da CBF corrompido ou ilegível: {exc}'
+        if article_fallback_reason:
+            raise FutebolError(
+                f'Falha no artigo CBF; motivo: {article_fallback_reason}. '
+                f'Falha no document_url oficial {document_url}; motivo: {document_error}.'
+            ) from exc
+        raise FutebolError(document_error) from exc
     if not pages or not any(page.strip() for page in pages):
-        raise FutebolError('PDF da CBF não possui camada textual utilizável.')
+        document_error = 'PDF da CBF não possui camada textual utilizável.'
+        if article_fallback_reason:
+            raise FutebolError(
+                f'Falha no artigo CBF; motivo: {article_fallback_reason}. '
+                f'Falha no document_url oficial {document_url}; motivo: {document_error}'
+            )
+        raise FutebolError(document_error)
     ensure_dirs()
     raw_path = RAW_DIR / f'cbf_{config["season"]}_real.pdf'
     raw_path.write_bytes(body)
-    return SourceSnapshot('CBF', document_url, 'real', now_iso(config['timezone']), '\n'.join(pages), raw_path, 'pdf', hashlib.sha256(body).hexdigest(), len(body), response.geturl() if hasattr(response, 'geturl') else document_url, content_type, len(pages), pages)
+    return SourceSnapshot('CBF', document_url, 'real', now_iso(config['timezone']), '\n'.join(pages), raw_path, 'pdf', hashlib.sha256(body).hexdigest(), len(body), response.geturl() if hasattr(response, 'geturl') else document_url, content_type, len(pages), pages, article_fallback_reason)
 
 def clean_text(value: str) -> str:
     value = re.sub(r'<(?:script|style|svg)\b[^>]*>.*?</(?:script|style|svg)>', ' ', value, flags=re.I | re.S)
@@ -443,7 +482,13 @@ def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[s
         normalized.append(match)
     normalized.sort(key=lambda item: (item['round'], item['kickoff'] or '9999-12-31T23:59:59-03:00', item['home_team'], item['away_team']))
     validate_matches(normalized)
-    return {'schema_version': 1, 'data_mode': source.status, 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'source_article_url': config.get('source', {}).get('article_url', ''), 'source_document_url': source.url, 'source_url': source.url, 'url': source.url, 'final_url': source.final_url or source.url, 'status': source.status, 'source_format': source.source_format, 'content_type': source.content_type, 'fetched_at': source.fetched_at, 'captured_at': source.fetched_at, 'document_sha256': source.document_sha256, 'content_length': source.content_length, 'page_count': source.page_count, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'rounds': sorted({m['round'] for m in normalized}), 'matches': normalized}
+    source_metadata = {'provider': source.provider, 'source_article_url': config.get('source', {}).get('article_url', ''), 'source_document_url': source.url, 'source_url': source.url, 'url': source.url, 'final_url': source.final_url or source.url, 'status': source.status, 'source_format': source.source_format, 'content_type': source.content_type, 'fetched_at': source.fetched_at, 'captured_at': source.fetched_at, 'document_sha256': source.document_sha256, 'content_length': source.content_length, 'page_count': source.page_count, 'raw_path': str(source.raw_path) if source.raw_path else ''}
+    if source.article_fallback_reason:
+        source_metadata['article_discovery'] = 'failed; configured official document_url used'
+        source_metadata['article_failure_reason'] = source.article_fallback_reason
+    else:
+        source_metadata['article_discovery'] = 'success'
+    return {'schema_version': 1, 'data_mode': source.status, 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': source_metadata, 'rounds': sorted({m['round'] for m in normalized}), 'matches': normalized}
 
 def build_summary(matches: list[dict[str, Any]]) -> dict[str, int]:
     return {'total_matches': len(matches), 'scheduled_matches': sum((1 for match in matches if match.get('status') == 'scheduled')), 'unscheduled_matches': sum((1 for match in matches if match.get('status') == 'unscheduled'))}
