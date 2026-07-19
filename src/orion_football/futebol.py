@@ -5,19 +5,20 @@ import html
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
+DATA_DIR = BASE_DIR.parent.parent / 'data'
+RAW_DIR = DATA_DIR / 'raw'
+NORMALIZED_DIR = DATA_DIR / 'normalized'
+ALERTS_DIR = BASE_DIR.parent.parent / 'state'
+STATE_DIR = ALERTS_DIR
 ALERT_LEDGER_PATH = BASE_DIR.parent.parent / 'state' / 'alerts.json'
 ALERTS_PLAN_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_plan.json'
 ALERTS_PREVIEW_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_preview.txt'
@@ -110,7 +111,6 @@ def parse_match(row: list[str], config: dict[str, Any], source: SourceSnapshot) 
     if local_match:
         (venue, city, state) = parse_location(local_match.group(1))
     broadcasters = parse_broadcasters(broadcast_cell)
-    identity = f"{config['competition']}|{config['season']}|{reference}|{round_number}|{home_team}|{away_team}"
     match_id = stable_match_id('CBF', config['competition'], config['season'], reference, home_team, away_team)
     return {'match_id': match_id, 'reference': reference, 'round': round_number, 'home_team': home_team, 'away_team': away_team, 'kickoff': kickoff.isoformat(timespec='seconds'), 'schedule_date': kickoff.date().isoformat(), 'schedule_time': f'{hour:02d}:{minute:02d}', 'schedule_note': None, 'venue': venue, 'city': city, 'state': state, 'broadcasters': broadcasters, 'status': 'scheduled'}
 
@@ -187,13 +187,12 @@ def validate_matches(matches: list[dict[str, Any]]) -> None:
 def match_sort_key(match: dict[str, Any]) -> tuple[Any, ...]:
     return (int(match['round']), match.get('kickoff') or '9999-12-31T23:59:59-03:00', match['home_team'], match['away_team'])
 
-def normalized_path(config: dict[str, Any], source: str='fixture') -> Path:
-    suffix = 'real' if source == 'real' else 'fixture'
-    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_{suffix}.json"
+def normalized_path(config: dict[str, Any]) -> Path:
+    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_fixture.json"
 
-def write_normalized(config: dict[str, Any], data: dict[str, Any], source: str='fixture') -> Path:
+def write_normalized(config: dict[str, Any], data: dict[str, Any]) -> Path:
     ensure_dirs()
-    path = normalized_path(config, source)
+    path = normalized_path(config)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return path
 
@@ -203,8 +202,8 @@ def write_fixture_raw(snapshot: SourceSnapshot) -> Path:
     raw_path.write_text(snapshot.html_text, encoding='utf-8')
     return raw_path
 
-def load_normalized(config: dict[str, Any], source: str='fixture') -> dict[str, Any]:
-    path = normalized_path(config, source)
+def load_normalized(config: dict[str, Any]) -> dict[str, Any]:
+    path = normalized_path(config)
     if not path.exists():
         raise FutebolError(f'JSON normalizado não encontrado: {path}')
     return json.loads(path.read_text(encoding='utf-8'))
@@ -428,7 +427,7 @@ def render_whatsapp_owner_team_message(config: dict[str, Any], data: dict[str, A
         when = 'Data e horário ainda não definidos pela CBF'
     location = render_location(match) or 'ainda não informado'
     broadcast = render_broadcast(match).replace('Transmissão: ', '')
-    return '\n'.join(['🔴⚫ PRÓXIMO JOGO DO FLAMENGO', '', when, f"{match['home_team']} x {match['away_team']}", '', f'📍 {location}', f'📺 {broadcast}', '', f"Brasileirão {data['season']} — {round_number}ª rodada", 'Fonte: CBF']).strip()
+    return '\n'.join([f"🔴⚫ PRÓXIMO JOGO DO {config['owner_team'].upper()}", '', when, f"{match['home_team']} x {match['away_team']}", '', f'📍 {location}', f'📺 {broadcast}', '', f"Brasileirão {data['season']} — {round_number}ª rodada", 'Fonte: CBF']).strip()
 
 def load_alert_ledger(path: Path=ALERT_LEDGER_PATH) -> dict[str, Any]:
     if not path.exists():
@@ -510,25 +509,17 @@ def capitalize_pt(value: str) -> str:
 
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
-    if args.source == 'fixture':
-        snapshot = fetch_fixture(config)
-        write_fixture_raw(snapshot)
-        data = normalize_snapshot(config, snapshot)
-        path = write_normalized(config, data, 'fixture')
-    else:
-        pdf_source = extract_pdf_text(download_pdf_from_article(config))
-        data = normalize_pdf_real(config, pdf_source)
-        path = write_normalized(config, data, 'real')
+    snapshot = fetch_fixture(config)
+    write_fixture_raw(snapshot)
+    data = normalize_snapshot(config, snapshot)
+    path = write_normalized(config, data)
     print(f'JSON normalizado salvo em: {path}')
     print(f"Partidas normalizadas: {len(data['matches'])}")
     return 0
 
 def cmd_preview(args: argparse.Namespace) -> int:
     config = load_config()
-    if args.source == 'fixture':
-        data = normalize_snapshot(config, fetch_fixture(config))
-    else:
-        data = load_normalized(config, args.source)
+    data = normalize_snapshot(config, fetch_fixture(config))
     if args.date or args.today:
         selected_date = local_today(config) if args.today else args.date
         print(render_daily_preview(config, data, selected_date, today=args.today))
@@ -536,29 +527,11 @@ def cmd_preview(args: argparse.Namespace) -> int:
         print(render_preview(data, round_number=args.round, current=args.current))
     return 0
 
-def cmd_run(args: argparse.Namespace) -> int:
-    if not args.dry_run:
-        raise FutebolError('--dry-run é obrigatório nesta fase.')
-    config = load_config()
-    if args.source == 'fixture':
-        snapshot = fetch_fixture(config)
-        write_fixture_raw(snapshot)
-        data = normalize_snapshot(config, snapshot)
-        path = write_normalized(config, data, 'fixture')
-    else:
-        pdf_source = extract_pdf_text(download_pdf_from_article(config))
-        data = normalize_pdf_real(config, pdf_source)
-        path = write_normalized(config, data, 'real')
-    print(f'DRY-RUN local concluído. JSON: {path}')
-    print('')
-    print(render_preview(data, current=True))
-    return 0
-
 def cmd_alerts(args: argparse.Namespace) -> int:
     if not args.dry_run:
         raise FutebolError('--dry-run é obrigatório para alertas nesta missão.')
     config = load_config()
-    data = load_normalized(config, args.source)
+    data = normalize_snapshot(config, fetch_fixture(config))
     generated_at = now_iso(config['timezone'])
     alerts = build_alerts(config, data, round_number=args.round, current=args.current, generated_at=generated_at)
     if not alerts:
@@ -580,40 +553,21 @@ def cmd_alerts(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
     subparsers = parser.add_subparsers(dest='command', required=True)
-    fetch_parser = subparsers.add_parser('fetch')
-    fetch_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
-    fetch_parser.set_defaults(func=cmd_fetch)
     normalize_parser = subparsers.add_parser('normalize')
-    normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
     preview_parser = subparsers.add_parser('preview')
-    preview_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     preview_group = preview_parser.add_mutually_exclusive_group()
     preview_group.add_argument('--round', type=int)
     preview_group.add_argument('--current', action='store_true')
     preview_group.add_argument('--date', type=parse_schedule_date)
     preview_group.add_argument('--today', action='store_true')
     preview_parser.set_defaults(func=cmd_preview)
-    run_parser = subparsers.add_parser('run')
-    run_parser.add_argument('--source', choices=['fixture', 'real'], required=True)
-    run_parser.add_argument('--dry-run', action='store_true', required=True)
-    run_parser.set_defaults(func=cmd_run)
     alerts_parser = subparsers.add_parser('alerts')
-    alerts_parser.add_argument('--source', choices=['fixture', 'real'], required=True)
     alerts_group = alerts_parser.add_mutually_exclusive_group(required=True)
     alerts_group.add_argument('--round', type=int)
     alerts_group.add_argument('--current', action='store_true')
     alerts_parser.add_argument('--dry-run', action='store_true', required=True)
     alerts_parser.set_defaults(func=cmd_alerts)
-    send_parser = subparsers.add_parser('send')
-    send_parser.add_argument('--source', choices=['real'], required=True)
-    send_group = send_parser.add_mutually_exclusive_group(required=True)
-    send_group.add_argument('--current', action='store_true')
-    send_group.add_argument('--round', type=int)
-    send_parser.add_argument('--alert-type', choices=['round_overview', 'owner_team_round'], required=True)
-    send_parser.add_argument('--self-only', action='store_true', required=True)
-    send_parser.add_argument('--confirm', required=True)
-    send_parser.set_defaults(func=cmd_send)
     return parser
 
 def main(argv: list[str] | None=None) -> int:
