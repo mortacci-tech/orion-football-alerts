@@ -2,10 +2,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
+from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -14,6 +18,9 @@ from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
+TEXT_FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_19_24_sample.txt'
+REAL_URL_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a'
+REAL_DOCUMENT_DEFAULT = 'https://stcbfsiteprdimgbrs.blob.core.windows.net/img-site/cdn/Tabela_Detalhada_Brasileiro_Serie_A_2026_19_a_24_rodada_82505dee72.pdf'
 DATA_DIR = BASE_DIR.parent.parent / 'data'
 RAW_DIR = DATA_DIR / 'raw'
 NORMALIZED_DIR = DATA_DIR / 'normalized'
@@ -37,6 +44,13 @@ class SourceSnapshot:
     fetched_at: str
     html_text: str
     raw_path: Path | None
+    source_format: str = 'html'
+    document_sha256: str = ''
+    content_length: int = 0
+    final_url: str = ''
+    content_type: str = ''
+    page_count: int = 0
+    pages: tuple[str, ...] = ()
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
@@ -58,9 +72,104 @@ def fetch_fixture(config: dict[str, Any]) -> SourceSnapshot:
     if not FIXTURE_PATH.exists():
         raise FutebolError(f'Fixture não encontrada: {FIXTURE_PATH}')
     tz_name = config['timezone']
-    return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=FIXTURE_PATH.read_text(encoding='utf-8'), raw_path=None)
+    text = FIXTURE_PATH.read_text(encoding='utf-8')
+    return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=text, raw_path=None, source_format='html', document_sha256=hashlib.sha256(text.encode()).hexdigest(), content_length=len(text.encode()))
+
+ALLOWED_HOSTS = {'cbf.com.br', 'www.cbf.com.br', 'stcbfsiteprdimgbrs.blob.core.windows.net'}
+
+def approved_url(value: str, *, document: bool = False) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != 'https' or parsed.hostname not in ALLOWED_HOSTS:
+        raise FutebolError(f'URL não pertence à infraestrutura oficial aprovada da CBF: {value}')
+    if document and not parsed.path.lower().endswith('.pdf'):
+        raise FutebolError(f'URL de documento CBF não é PDF: {value}')
+    return value
+
+def source_config(config: dict[str, Any]) -> dict[str, Any]:
+    return config.get('source', {})
+
+def _download(url: str, config: dict[str, Any], accept: str) -> tuple[bytes, Any, int]:
+    sc = source_config(config)
+    max_bytes = int(sc.get('max_download_bytes', 5_000_000))
+    request = urllib.request.Request(approved_url(url), headers={'User-Agent': sc.get('user_agent', 'orion-football-alerts/0.1'), 'Accept': accept})
+    try:
+        with urllib.request.urlopen(request, timeout=float(sc.get('timeout_seconds', 20))) as response:
+            status = getattr(response, 'status', None) or response.getcode()
+            if not 200 <= status < 300:
+                raise FutebolError(f'Fonte CBF respondeu HTTP {status}.')
+            content_main = response.headers.get_content_type().lower()
+            if accept == 'text/html' and content_main not in {'text/html', 'application/xhtml+xml'}:
+                raise FutebolError(f'Tipo de conteúdo inesperado no artigo CBF: {content_main}.')
+            if not hasattr(response, 'read'):
+                return b'', response, status
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(min(65536, max_bytes - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FutebolError(f'Download da CBF excede o limite de {max_bytes} bytes.')
+                chunks.append(chunk)
+            return b''.join(chunks), response, status
+    except urllib.error.HTTPError as exc:
+        raise FutebolError(f'Fonte CBF respondeu HTTP {exc.code}.') from exc
+    except urllib.error.URLError as exc:
+        raise FutebolError(f'Falha ao acessar a fonte CBF: {exc.reason}.') from exc
+
+def discover_document_url(article_html: str, config: dict[str, Any], base_url: str = REAL_URL_DEFAULT) -> str:
+    pattern = source_config(config).get('document_name_pattern', r'Tabela_Detalhada.*\.pdf')
+    for raw in re.findall(r'(?:href|src)=["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']', article_html, flags=re.I):
+        candidate = urljoin(base_url, html.unescape(raw))
+        if re.search(pattern, candidate, flags=re.I):
+            return approved_url(candidate, document=True)
+    for candidate in re.findall(r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?', article_html, flags=re.I):
+        if re.search(pattern, candidate, flags=re.I):
+            return approved_url(html.unescape(candidate), document=True)
+    raise FutebolError('Artigo oficial não contém link PDF de tabela detalhada aprovado.')
+
+def locate_document_url(config: dict[str, Any], article_html: str | None = None) -> str:
+    sc = source_config(config)
+    article_url = approved_url(sc.get('article_url') or REAL_URL_DEFAULT)
+    if article_html is None:
+        body, _, _ = _download(article_url, config, 'text/html')
+        article_html = body.decode('utf-8', errors='replace')
+    try:
+        return discover_document_url(article_html, config, article_url)
+    except FutebolError:
+        fallback = sc.get('document_url') or REAL_DOCUMENT_DEFAULT
+        return approved_url(fallback, document=True)
+
+def fetch_real(config: dict[str, Any]) -> SourceSnapshot:
+    article_url = approved_url(source_config(config).get('article_url') or REAL_URL_DEFAULT)
+    article_body, article_response, status = _download(article_url, config, 'text/html')
+    document_url = locate_document_url(config, article_body.decode('utf-8', errors='replace'))
+    body, response, status = _download(document_url, config, 'application/pdf')
+    if not body:
+        raise FutebolError('Resposta vazia: PDF da CBF vazio.')
+    content_type = response.headers.get('Content-Type', '')
+    content_main = response.headers.get_content_type().lower()
+    if content_main != 'application/pdf' and not body.startswith(b'%PDF'):
+        raise FutebolError(f'Resposta da CBF não é PDF (Content-Type: {content_type or "ausente"}).')
+    if not body.startswith(b'%PDF'):
+        raise FutebolError('Resposta declarada como PDF, mas não possui assinatura %PDF.')
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(body))
+        pages = tuple((page.extract_text() or '') for page in reader.pages)
+    except Exception as exc:
+        raise FutebolError(f'PDF da CBF corrompido ou ilegível: {exc}') from exc
+    if not pages or not any(page.strip() for page in pages):
+        raise FutebolError('PDF da CBF não possui camada textual utilizável.')
+    ensure_dirs()
+    raw_path = RAW_DIR / f'cbf_{config["season"]}_real.pdf'
+    raw_path.write_bytes(body)
+    return SourceSnapshot('CBF', document_url, 'real', now_iso(config['timezone']), '\n'.join(pages), raw_path, 'pdf', hashlib.sha256(body).hexdigest(), len(body), response.geturl() if hasattr(response, 'geturl') else document_url, content_type, len(pages), pages)
 
 def clean_text(value: str) -> str:
+    value = re.sub(r'<(?:script|style|svg)\b[^>]*>.*?</(?:script|style|svg)>', ' ', value, flags=re.I | re.S)
+    value = re.sub(r'<img\b[^>]*>', ' ', value, flags=re.I)
     value = html.unescape(re.sub('<[^>]+>', ' ', value))
     return re.sub('\\s+', ' ', value).strip()
 
@@ -69,10 +178,87 @@ def extract_rows(html_text: str) -> list[list[str]]:
     for row_html in re.findall('<tr\\b[^>]*>(.*?)</tr>', html_text, flags=re.I | re.S):
         cells = re.findall('<t[dh]\\b[^>]*>(.*?)</t[dh]>', row_html, flags=re.I | re.S)
         cleaned = [clean_text(cell) for cell in cells]
-        if cleaned and any(('Ref:' in cell or 'Rodada:' in cell for cell in cleaned)):
+        if cleaned and any(('Ref:' in cell and 'Rodada:' in cell for cell in cleaned)):
             rows.append(cleaned)
     if not rows:
         raise FutebolError('Nenhuma linha de partida encontrada na estrutura HTML esperada da CBF.')
+    return rows
+
+CITY_NAMES = ('Bragança Paulista', 'Belo Horizonte', 'Rio de Janeiro', 'São Paulo', 'Porto Alegre', 'Chapecó', 'Curitiba', 'Salvador', 'Mirassol', 'Santos', 'Belém')
+STATE_CODES = r'AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO'
+
+def parse_pdf_line(line: str, config: dict[str, Any]) -> dict[str, Any] | None:
+    line = re.sub(r'^A definir(?=\d)', '', line, flags=re.I).strip()
+    pending = re.match(rf'^(\d+)\s+(\d+)[ªaº]?\s+A\s+(?:def\.?|definir)\.?\s+(.+?)\s+({STATE_CODES})\s+x\s+(.+?)\s+({STATE_CODES})\s+(.*)$', line, flags=re.I)
+    if pending:
+        reference, round_text, home, _home_uf, away, _away_uf, rest = pending.groups()
+        rest = re.sub(r'\s+[1-7](?:\s+[1-7])*$', '', rest).strip()
+        state_match = re.search(rf'\s+({STATE_CODES})$', rest)
+        state = state_match.group(1) if state_match else ''
+        before = rest[:state_match.start()].strip() if state_match else ''
+        city = next((name for name in sorted(CITY_NAMES, key=len, reverse=True) if before.endswith(name)), '')
+        venue = before[:-len(city)].strip() if city else ''
+        return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': int(round_text), 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': None, 'schedule_date': None, 'schedule_time': None, 'schedule_note': 'Data e horário a definir pela CBF', 'venue': venue, 'city': city, 'state': state, 'broadcasters': [], 'status': 'unscheduled'}
+    pattern = rf'^(\d+)\s+(?:(\d+)[ªaº]?\s+)?(\d{{2}}/\d{{2}})\s+\S+\s+(?:(\d{{1,2}}:\d{{2}})\s+)?(.+?)\s+({STATE_CODES})\s+x\s+(.+?)\s+({STATE_CODES})\s+(.*)$'
+    match = re.match(pattern, line, flags=re.I)
+    if not match: return None
+    reference, round_text, date_text, time_text, home, _home_uf, away, _away_uf, rest = match.groups()
+    round_number = int(round_text) if round_text else config.get('_pdf_current_round')
+    if round_number is None: return None
+    if not time_text or re.match(r'(?i)a\s*def', time_text):
+        return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': round_number, 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': None, 'schedule_date': None, 'schedule_time': None, 'schedule_note': 'Data e horário a definir pela CBF', 'venue': '', 'city': '', 'state': '', 'broadcasters': [], 'status': 'unscheduled'}
+    day, month = map(int, date_text.split('/')); hour, minute = map(int, time_text.split(':'))
+    kickoff = datetime(int(config['season']), month, day, hour, minute, tzinfo=ZoneInfo(config['timezone']))
+    broadcast_numbers = re.findall(r'(?<!\d)[1-7](?!\d)', rest)
+    rest = re.sub(r'\s+[1-7](?:\s+[1-7])*$', '', rest).strip()
+    state_match = re.search(rf'\s+({STATE_CODES})$', rest)
+    state = state_match.group(1) if state_match else ''
+    before = rest[:state_match.start()].strip() if state_match else ''
+    city = next((name for name in sorted(CITY_NAMES, key=len, reverse=True) if before.endswith(name)), '')
+    venue = before[:-len(city)].strip() if city else ''
+    return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': round_number, 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': kickoff.isoformat(timespec='seconds'), 'schedule_date': kickoff.date().isoformat(), 'schedule_time': f'{hour:02d}:{minute:02d}', 'schedule_note': None, 'venue': venue, 'city': city, 'state': state, 'broadcasters': [BROADCASTERS_BY_COLUMN[c] for c in broadcast_numbers], 'status': 'scheduled'}
+
+def extract_json_rows(text: str) -> list[list[str]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise FutebolError('JSON da CBF inválido.') from exc
+    groups = payload if isinstance(payload, list) else payload.get('jogos') or payload.get('matches') or payload.get('data')
+    if isinstance(groups, dict):
+        groups = groups.get('jogos') or groups.get('matches') or groups.get('data')
+    if not isinstance(groups, list) or not groups:
+        raise FutebolError('Estrutura JSON da CBF não reconhecida; tabela não foi considerada completa.')
+    rows = []
+    games = []
+    for group in groups:
+        if isinstance(group, dict) and isinstance(group.get('jogo'), list):
+            games.extend(group['jogo'])
+        else:
+            games.append(group)
+    for game in games:
+        if not isinstance(game, dict):
+            raise FutebolError('Estrutura JSON da CBF não reconhecida.')
+        ref = game.get('reference') or game.get('ref_jogo') or game.get('id_jogo') or game.get('id')
+        rnd = game.get('round') or game.get('rodada')
+        home = game.get('home_team') or game.get('mandante') or game.get('time_mandante')
+        away = game.get('away_team') or game.get('visitante') or game.get('time_visitante')
+        if isinstance(home, dict): home = home.get('nome')
+        if isinstance(away, dict): away = away.get('nome')
+        raw_date = game.get('date') or game.get('data')
+        raw_time = game.get('time') or game.get('hora') or game.get('horario')
+        if not all((ref, rnd, home, away, raw_date, raw_time)):
+            raise FutebolError('Campos essenciais ausentes na estrutura JSON da CBF.')
+        date_text = str(raw_date).replace('-', '/')
+        if re.match(r'^\d{4}/', date_text):
+            year, month, day = date_text.split('/')[:3]
+            date_text = f'{day}/{month}/{year}'
+        venue = game.get('estadio') or ''
+        city = game.get('cidade') or ''
+        state = game.get('uf') or ''
+        location = ' - '.join(str(part) for part in (venue, city, state) if part)
+        date_cell = f'Data: {date_text} às {str(raw_time).replace(":", "h")}'
+        if location: date_cell += f' Local: {location}'
+        rows.append([f'Ref: {ref} Rodada: {rnd}', '', f'{home} x {away}', date_cell, str(game.get('broadcast') or game.get('transmissao') or '')])
     return rows
 
 def parse_match(row: list[str], config: dict[str, Any], source: SourceSnapshot) -> dict[str, Any]:
@@ -142,18 +328,39 @@ def parse_broadcasters(raw: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[str, Any]:
-    matches = [parse_match(row, config, source) for row in extract_rows(source.html_text)]
+    if source.source_format in {'pdf', 'text'}:
+        matches = []
+        for line in source.html_text.splitlines():
+            parsed = parse_pdf_line(line, config)
+            if parsed:
+                config['_pdf_current_round'] = parsed['round']
+                matches.append(parsed)
+        if not matches:
+            raise FutebolError('Nenhuma partida encontrada no texto extraído do PDF da CBF.')
+    elif source.source_format == 'json':
+        payload = json.loads(source.html_text)
+        games = payload.get('jogos', payload) if isinstance(payload, dict) else payload
+        matches = []
+        for game in games:
+            ref = str(game.get('id') or game.get('reference'))
+            raw_date = str(game.get('data')).replace('-', '/')
+            if re.match(r'^\d{4}/', raw_date):
+                year, month, day = raw_date.split('/')[:3]; raw_date = f'{day}/{month}/{year}'
+            row = [f'Ref: {ref} Rodada: {game.get("rodada")}', '', f'{game.get("mandante")} x {game.get("visitante")}', f'Data: {raw_date} às {str(game.get("horario")).replace(":", "h")}', '']
+            matches.append(parse_match(row, config, source))
+    else:
+        matches = [parse_match(row, config, source) for row in extract_rows(source.html_text)]
     seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
     for match in matches:
-        key = '|'.join([str(match['reference']), str(match['round']), match['home_team'], match['away_team'], match['kickoff']])
+        key = '|'.join([str(match['reference']), str(match['round']), match['home_team'], match['away_team'], str(match['kickoff'])])
         if key in seen:
-            continue
+            raise FutebolError(f'Partida duplicada detectada: {match["reference"]} {match["home_team"]} x {match["away_team"]}.')
         seen.add(key)
-        deduped.append(match)
-    deduped.sort(key=lambda item: (item['round'], item['kickoff'], item['home_team'], item['away_team']))
-    validate_matches(deduped)
-    return {'schema_version': 1, 'data_mode': 'fixture', 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'url': source.url, 'status': source.status, 'fetched_at': source.fetched_at, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'matches': deduped}
+        normalized.append(match)
+    normalized.sort(key=lambda item: (item['round'], item['kickoff'] or '9999-12-31T23:59:59-03:00', item['home_team'], item['away_team']))
+    validate_matches(normalized)
+    return {'schema_version': 1, 'data_mode': source.status, 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'source_article_url': config.get('source', {}).get('article_url', ''), 'source_document_url': source.url, 'source_url': source.url, 'url': source.url, 'final_url': source.final_url or source.url, 'status': source.status, 'source_format': source.source_format, 'content_type': source.content_type, 'fetched_at': source.fetched_at, 'captured_at': source.fetched_at, 'document_sha256': source.document_sha256, 'content_length': source.content_length, 'page_count': source.page_count, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'rounds': sorted({m['round'] for m in normalized}), 'matches': normalized}
 
 def build_summary(matches: list[dict[str, Any]]) -> dict[str, int]:
     return {'total_matches': len(matches), 'scheduled_matches': sum((1 for match in matches if match.get('status') == 'scheduled')), 'unscheduled_matches': sum((1 for match in matches if match.get('status') == 'unscheduled'))}
@@ -188,7 +395,7 @@ def match_sort_key(match: dict[str, Any]) -> tuple[Any, ...]:
     return (int(match['round']), match.get('kickoff') or '9999-12-31T23:59:59-03:00', match['home_team'], match['away_team'])
 
 def normalized_path(config: dict[str, Any]) -> Path:
-    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_fixture.json"
+    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_{config.get('_data_mode', 'fixture')}.json"
 
 def write_normalized(config: dict[str, Any], data: dict[str, Any]) -> Path:
     ensure_dirs()
@@ -509,8 +716,10 @@ def capitalize_pt(value: str) -> str:
 
 def cmd_normalize(args: argparse.Namespace) -> int:
     config = load_config()
-    snapshot = fetch_fixture(config)
-    write_fixture_raw(snapshot)
+    config['_data_mode'] = args.source
+    snapshot = fetch_fixture(config) if args.source == 'fixture' else fetch_real(config)
+    if args.source == 'fixture':
+        write_fixture_raw(snapshot)
     data = normalize_snapshot(config, snapshot)
     path = write_normalized(config, data)
     print(f'JSON normalizado salvo em: {path}')
@@ -519,7 +728,8 @@ def cmd_normalize(args: argparse.Namespace) -> int:
 
 def cmd_preview(args: argparse.Namespace) -> int:
     config = load_config()
-    data = normalize_snapshot(config, fetch_fixture(config))
+    config['_data_mode'] = args.source
+    data = load_normalized(config) if args.source == 'real' else normalize_snapshot(config, fetch_fixture(config))
     if args.date or args.today:
         selected_date = local_today(config) if args.today else args.date
         print(render_daily_preview(config, data, selected_date, today=args.today))
@@ -531,7 +741,8 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     if not args.dry_run:
         raise FutebolError('--dry-run é obrigatório para alertas nesta missão.')
     config = load_config()
-    data = normalize_snapshot(config, fetch_fixture(config))
+    config['_data_mode'] = args.source
+    data = normalize_snapshot(config, fetch_fixture(config) if args.source == 'fixture' else fetch_real(config))
     generated_at = now_iso(config['timezone'])
     alerts = build_alerts(config, data, round_number=args.round, current=args.current, generated_at=generated_at)
     if not alerts:
@@ -554,8 +765,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
     subparsers = parser.add_subparsers(dest='command', required=True)
     normalize_parser = subparsers.add_parser('normalize')
+    normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)
     preview_parser = subparsers.add_parser('preview')
+    preview_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     preview_group = preview_parser.add_mutually_exclusive_group()
     preview_group.add_argument('--round', type=int)
     preview_group.add_argument('--current', action='store_true')
@@ -563,6 +776,7 @@ def build_parser() -> argparse.ArgumentParser:
     preview_group.add_argument('--today', action='store_true')
     preview_parser.set_defaults(func=cmd_preview)
     alerts_parser = subparsers.add_parser('alerts')
+    alerts_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     alerts_group = alerts_parser.add_mutually_exclusive_group(required=True)
     alerts_group.add_argument('--round', type=int)
     alerts_group.add_argument('--current', action='store_true')
