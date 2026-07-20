@@ -26,20 +26,16 @@ class FutebolTests(unittest.TestCase):
         with patch("orion_football.futebol.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
     def test_preview_data_com_multiplos_jogos_e_ordem(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16")
-        self.assertIn("⚽ JOGOS DE 16/07/2026",p)
-        self.assertNotIn("HOJE",p)
-        self.assertIn("19h30 — Botafogo x Santos",p)
-        self.assertIn("19h30 — Vitória x Vasco da Gama",p)
+        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n*Jogos em 16/07/2026*\n\nBotafogo x Santos · 19h30\nVitória x Vasco da Gama · 19h30\nMirassol x Grêmio · 20h00")
         self.assertLess(p.index("Botafogo"),p.index("Vitória"))
         self.assertNotIn("Fonte: CBF",p)
+        self.assertNotIn("Nilton Santos",p)
     def test_preview_destaca_favorito(self):
-        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23")
-        self.assertTrue(p.startswith("🔴⚫ FLAMENGO EM 23/07/2026"))
-        self.assertIn("20h00 — Flamengo x Botafogo",p)
-        self.assertIn("📍 Maracanã — Rio de Janeiro/RJ",p)
-        self.assertIn("📺 Globo, Premiere",p)
+        c,d=self.data(); d=copy.deepcopy(d); other=next(m for m in d["matches"] if m["home_team"]=="Botafogo"); other["schedule_date"]="2026-07-23"; other["schedule_time"]="18:30"; p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
+        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n🔴⚫ *Hoje tem Flamengo*\n\nFlamengo x Botafogo\n20h00\n\n📺 Globo e Premiere\n\n*Outros jogos de hoje*\n\nBotafogo x Santos · 18h30")
+        self.assertEqual(p.count("Flamengo x Botafogo"), 1)
     def test_preview_data_sem_jogos(self):
-        c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ NÃO HÁ JOGOS EM 22/07/2026")
+        c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ Não há jogos no BRASILEIRÃO 2026 em 22/07/2026.")
     def test_data_invalida(self):
         with self.assertRaises(futebol.FutebolError): futebol.parse_schedule_date("22/07/2026")
     def test_today_com_relogio_injetado(self):
@@ -51,6 +47,34 @@ class FutebolTests(unittest.TestCase):
         self.assertNotIn("📍",p); self.assertNotIn("📺",p)
     def test_preview_today_usa_hoje(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
-        self.assertTrue(p.startswith("🔴⚫ HOJE TEM FLAMENGO"))
+        self.assertIn("*Hoje tem Flamengo*", p)
+    def test_preview_today_sem_favorito(self):
+        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16",today=True)
+        self.assertIn("*Hoje no Brasileirão*", p)
+    def test_favorito_sem_transmissao_e_sem_outros_jogos(self):
+        c,d=self.data(); d=copy.deepcopy(d)
+        matches=[m for m in d["matches"] if m["schedule_date"]=="2026-07-23"]
+        for match in matches:
+            if "Flamengo" in (match["home_team"], match["away_team"]): match["broadcasters"]=[]
+        d["matches"]=[m for m in d["matches"] if m not in matches or "Flamengo" in (m["home_team"], m["away_team"])]
+        p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
+        self.assertNotIn("📺", p); self.assertNotIn("Outros jogos", p); self.assertNotIn("\n\n\n", p)
+    def test_competicao_e_time_favorito_parametrizados(self):
+        c,d=self.data(); c["owner_team"]="Botafogo"; d=copy.deepcopy(d); d["competition"]="Copa Exemplo"
+        p=futebol.render_daily_preview(c,d,"2026-07-16",today=True)
+        self.assertIn("🏆 *COPA EXEMPLO 2026*", p); self.assertIn("*Hoje tem Botafogo*", p); self.assertNotIn("Flamengo", p)
+    def test_pregame_minutos_parametrizados(self):
+        c,d=self.data(); match=futebol.select_owner_match_by_date(c,d,"2026-07-23")
+        p=futebol.render_pregame_alert(match, 25)
+        self.assertEqual(p, "⏰ *Faltam 25 minutos*\n\nFlamengo x Botafogo\n20h00\n\n📺 Globo e Premiere")
+        self.assertNotIn("Começa às", p); self.assertNotIn("Maracanã", p); self.assertNotIn("Fonte", p)
+    def test_pregame_sem_transmissao_e_minutos_invalidos(self):
+        c,d=self.data(); match=copy.deepcopy(futebol.select_owner_match_by_date(c,d,"2026-07-23")); match["broadcasters"]=[]
+        self.assertNotIn("📺", futebol.render_pregame_alert(match, 5))
+        with self.assertRaises(futebol.FutebolError): futebol.render_pregame_alert(match, -1)
+    def test_cli_date_today_e_pregame(self):
+        self.assertEqual(futebol.main(["preview", "--source", "fixture", "--date", "2026-07-16"]), 0)
+        self.assertEqual(futebol.main(["preview", "--source", "fixture", "--today"]), 0)
+        self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23", "--minutes", "15"]), 0)
 
 if __name__ == "__main__": unittest.main()

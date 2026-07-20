@@ -33,8 +33,15 @@ Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo G
 
 ```bash
 PYTHONPATH=src python3 -c 'from orion_football import futebol; c=futebol.load_config(); d=futebol.normalize_snapshot(c, futebol.fetch_fixture(c)); print(futebol.render_preview(d, round_number=19))'
+PYTHONPATH=src python3 -m orion_football.futebol preview --source fixture --date 2026-07-16
+PYTHONPATH=src python3 -m orion_football.futebol pregame --source fixture --date 2026-07-23 --minutes 10
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+`preview --date` e `preview --today` geram o resumo diário. Quando o time
+favorito configurado joga, ele aparece em destaque. `pregame` seleciona esse
+jogo pela data e gera uma mensagem curta com os minutos informados. Todos os
+comandos são locais, determinísticos e não enviam mensagens.
 
 ## Limitações
 

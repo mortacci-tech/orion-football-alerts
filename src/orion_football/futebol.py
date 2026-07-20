@@ -308,30 +308,68 @@ def local_today(config: dict[str, Any], now: datetime | None = None) -> date:
 def render_daily_preview(config: dict[str, Any], data: dict[str, Any], selected_date: date | str, today: bool = False) -> str:
     target = parse_schedule_date(selected_date) if isinstance(selected_date, str) else selected_date
     matches = select_matches_by_date(data, target)
+    competition = display_competition(data)
     if not matches:
-        return f'⚽ NÃO HÁ JOGOS EM {target:%d/%m/%Y}'
+        when = 'hoje' if today else f'em {target:%d/%m/%Y}'
+        return f'⚽ Não há jogos no {competition} {when}.'
     owner = config['owner_team']
     owner_matches = [match for match in matches if owner.casefold() in {match['home_team'].casefold(), match['away_team'].casefold()}]
-    date_label = 'HOJE' if today else f'{target:%d/%m/%Y}'
-    lines = [f'🔴⚫ {date_label} TEM {owner.upper()}' if owner_matches and today else f'🔴⚫ {owner.upper()} EM {target:%d/%m/%Y}' if owner_matches else f'⚽ JOGOS DE {date_label}', '']
-    selected = owner_matches + [match for match in matches if match not in owner_matches]
+    lines = [f'🏆 *{competition}*', '']
     if owner_matches:
         selected_owner = owner_matches[0]
-        lines.append(f"{selected_owner['schedule_time'].replace(':', 'h')} — {selected_owner['home_team']} x {selected_owner['away_team']}")
-        location = render_location(selected_owner)
-        if location:
-            lines.append(f'📍 {location}')
+        owner_heading = f'Hoje tem {owner}' if today else f'{owner} joga em {target:%d/%m/%Y}'
+        lines.extend([f"{config.get('owner_marker', '🔴⚫')} *{owner_heading}*", '', render_match_pair(selected_owner), render_match_time(selected_owner)])
         if selected_owner.get('broadcasters'):
-            lines.append(f"📺 {', '.join(selected_owner['broadcasters'])}")
+            lines.extend(['', f"📺 {format_broadcasters(selected_owner['broadcasters'])}"])
         others = [match for match in matches if match not in owner_matches]
         if others:
-            lines.extend(['', '⚽ OUTROS JOGOS', ''])
-            selected = others
-        else:
-            selected = []
-    for match in selected:
-        lines.append(f"{match['schedule_time'].replace(':', 'h')} — {match['home_team']} x {match['away_team']}")
+            lines.extend(['', '*Outros jogos de hoje*' if today else f'*Outros jogos em {target:%d/%m/%Y}*', ''])
+            lines.extend(render_match_line(match) for match in others)
+    else:
+        heading = '*Hoje no ' + display_competition_name(data) + '*' if today else f'*Jogos em {target:%d/%m/%Y}*'
+        lines.extend([heading, ''])
+        lines.extend(render_match_line(match) for match in matches)
     return '\n'.join(lines).strip()
+
+def display_competition(data: dict[str, Any]) -> str:
+    return f'{display_competition_name(data).upper()} {data["season"]}'
+
+def display_competition_name(data: dict[str, Any]) -> str:
+    competition = str(data.get('competition_display_name') or data['competition']).strip()
+    if competition == 'campeonato_brasileiro_serie_a':
+        competition = 'Brasileirão'
+    return competition
+
+def render_match_pair(match: dict[str, Any]) -> str:
+    return f"{match['home_team']} x {match['away_team']}"
+
+def render_match_time(match: dict[str, Any]) -> str:
+    return match['schedule_time'].replace(':', 'h')
+
+def render_match_line(match: dict[str, Any]) -> str:
+    return f'{render_match_pair(match)} · {render_match_time(match)}'
+
+def format_broadcasters(broadcasters: list[str]) -> str:
+    if len(broadcasters) == 1:
+        return broadcasters[0]
+    return ', '.join(broadcasters[:-1]) + ' e ' + broadcasters[-1]
+
+def select_owner_match_by_date(config: dict[str, Any], data: dict[str, Any], selected_date: date | str) -> dict[str, Any]:
+    matches = select_matches_by_date(data, selected_date)
+    owner = config['owner_team'].casefold()
+    owner_matches = [match for match in matches if owner in {match['home_team'].casefold(), match['away_team'].casefold()}]
+    if not owner_matches:
+        target = parse_schedule_date(selected_date) if isinstance(selected_date, str) else selected_date
+        raise FutebolError(f"Nenhum jogo do {config['owner_team']} em {target:%d/%m/%Y}.")
+    return owner_matches[0]
+
+def render_pregame_alert(match: dict[str, Any], minutes: int) -> str:
+    if minutes < 0:
+        raise FutebolError('Minutos para o pré-jogo não podem ser negativos.')
+    lines = [f'⏰ *Faltam {minutes} minutos*', '', render_match_pair(match), render_match_time(match)]
+    if match.get('broadcasters'):
+        lines.extend(['', f"📺 {format_broadcasters(match['broadcasters'])}"])
+    return '\n'.join(lines)
 
 def select_round(data: dict[str, Any], round_number: int | None=None, current: bool=False) -> int:
     if current:
@@ -523,6 +561,14 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     print(f"Partidas normalizadas: {len(data['matches'])}")
     return 0
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    config = load_config()
+    if args.source != 'fixture':
+        raise FutebolError('fetch real não é suportado; use normalize --source real.')
+    path = write_fixture_raw(fetch_fixture(config))
+    print(f'Fixture salva em: {path}')
+    return 0
+
 def cmd_preview(args: argparse.Namespace) -> int:
     config = load_config()
     if args.source == 'fixture':
@@ -534,6 +580,16 @@ def cmd_preview(args: argparse.Namespace) -> int:
         print(render_daily_preview(config, data, selected_date, today=args.today))
     else:
         print(render_preview(data, round_number=args.round, current=args.current))
+    return 0
+
+def cmd_pregame(args: argparse.Namespace) -> int:
+    config = load_config()
+    if args.source == 'fixture':
+        data = normalize_snapshot(config, fetch_fixture(config))
+    else:
+        data = load_normalized(config, args.source)
+    match = select_owner_match_by_date(config, data, args.date)
+    print(render_pregame_alert(match, args.minutes))
     return 0
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -577,6 +633,9 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     print('WhatsApp enviado: NÃO')
     return 0
 
+def cmd_send(args: argparse.Namespace) -> int:
+    raise FutebolError('Envio não está disponível neste produto.')
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -594,6 +653,11 @@ def build_parser() -> argparse.ArgumentParser:
     preview_group.add_argument('--date', type=parse_schedule_date)
     preview_group.add_argument('--today', action='store_true')
     preview_parser.set_defaults(func=cmd_preview)
+    pregame_parser = subparsers.add_parser('pregame', help='gera um alerta local pré-jogo do time favorito')
+    pregame_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
+    pregame_parser.add_argument('--date', type=parse_schedule_date, required=True)
+    pregame_parser.add_argument('--minutes', type=int, required=True)
+    pregame_parser.set_defaults(func=cmd_pregame)
     run_parser = subparsers.add_parser('run')
     run_parser.add_argument('--source', choices=['fixture', 'real'], required=True)
     run_parser.add_argument('--dry-run', action='store_true', required=True)
