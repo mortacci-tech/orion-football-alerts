@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 ## Configuração
 
-Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo Git e ajuste a fonte conforme os termos do provedor. A primeira versão pública usa fixture; nenhuma credencial é necessária.
+Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo Git e ajuste a fonte e `competition_display_name` conforme os termos do provedor. A primeira versão pública usa fixture; nenhuma credencial é necessária.
 
 ## Comandos usando fixture
 

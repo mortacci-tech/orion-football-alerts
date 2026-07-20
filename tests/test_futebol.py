@@ -1,6 +1,8 @@
 import copy
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,16 @@ from orion_football import futebol
 class FutebolTests(unittest.TestCase):
     def data(self):
         c=futebol.load_config(); return c, futebol.normalize_snapshot(c, futebol.fetch_fixture(c))
+    def favorite_day_with_others(self):
+        c,d=self.data(); d=copy.deepcopy(d)
+        favorite=next(m for m in d["matches"] if "Flamengo" in (m["home_team"], m["away_team"]))
+        early=copy.deepcopy(next(m for m in d["matches"] if m["home_team"]=="Botafogo"))
+        late=copy.deepcopy(next(m for m in d["matches"] if m["home_team"]=="Mirassol"))
+        favorite.update(home_team="Flamengo", away_team="Adversário", schedule_date="2026-07-23", schedule_time="20:00", broadcasters=["Globo", "Premiere"])
+        early.update(home_team="Time A", away_team="Time B", schedule_date="2026-07-23", schedule_time="19:30", broadcasters=[])
+        late.update(home_team="Time C", away_team="Time D", schedule_date="2026-07-23", schedule_time="21:30", broadcasters=[])
+        d["matches"]=[late, favorite, early]
+        return c,d
     def test_fixture_normalizada(self):
         _,d=self.data(); self.assertEqual(d["data_mode"],"fixture"); self.assertEqual({m["round"] for m in d["matches"]},{19,20})
     def test_time_e_timezone(self):
@@ -31,9 +43,10 @@ class FutebolTests(unittest.TestCase):
         self.assertNotIn("Fonte: CBF",p)
         self.assertNotIn("Nilton Santos",p)
     def test_preview_destaca_favorito(self):
-        c,d=self.data(); d=copy.deepcopy(d); other=next(m for m in d["matches"] if m["home_team"]=="Botafogo"); other["schedule_date"]="2026-07-23"; other["schedule_time"]="18:30"; p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
-        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n🔴⚫ *Hoje tem Flamengo*\n\nFlamengo x Botafogo\n20h00\n\n📺 Globo e Premiere\n\n*Outros jogos de hoje*\n\nBotafogo x Santos · 18h30")
-        self.assertEqual(p.count("Flamengo x Botafogo"), 1)
+        c,d=self.favorite_day_with_others(); p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
+        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n🔴⚫ *Hoje tem Flamengo*\n\nFlamengo x Adversário\n20h00\n\n📺 Globo e Premiere\n\n*Outros jogos de hoje*\n\nTime A x Time B · 19h30\nTime C x Time D · 21h30")
+        self.assertEqual(p.count("Flamengo x Adversário"), 1)
+        self.assertLess(p.index("Time A"), p.index("Time C")); self.assertNotIn("Local:", p); self.assertNotIn("Fonte:", p); self.assertNotIn("\n\n\n", p)
     def test_preview_data_sem_jogos(self):
         c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ Não há jogos no BRASILEIRÃO 2026 em 22/07/2026.")
     def test_data_invalida(self):
@@ -60,7 +73,7 @@ class FutebolTests(unittest.TestCase):
         p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
         self.assertNotIn("📺", p); self.assertNotIn("Outros jogos", p); self.assertNotIn("\n\n\n", p)
     def test_competicao_e_time_favorito_parametrizados(self):
-        c,d=self.data(); c["owner_team"]="Botafogo"; d=copy.deepcopy(d); d["competition"]="Copa Exemplo"
+        c,d=self.data(); c["owner_team"]="Botafogo"; d=copy.deepcopy(d); d["competition"]="copa_exemplo"; d["competition_display_name"]="Copa Exemplo"
         p=futebol.render_daily_preview(c,d,"2026-07-16",today=True)
         self.assertIn("🏆 *COPA EXEMPLO 2026*", p); self.assertIn("*Hoje tem Botafogo*", p); self.assertNotIn("Flamengo", p)
     def test_pregame_minutos_parametrizados(self):
@@ -72,9 +85,16 @@ class FutebolTests(unittest.TestCase):
         c,d=self.data(); match=copy.deepcopy(futebol.select_owner_match_by_date(c,d,"2026-07-23")); match["broadcasters"]=[]
         self.assertNotIn("📺", futebol.render_pregame_alert(match, 5))
         with self.assertRaises(futebol.FutebolError): futebol.render_pregame_alert(match, -1)
-    def test_cli_date_today_e_pregame(self):
-        self.assertEqual(futebol.main(["preview", "--source", "fixture", "--date", "2026-07-16"]), 0)
-        self.assertEqual(futebol.main(["preview", "--source", "fixture", "--today"]), 0)
+    def test_cli_date_usa_titulo_de_data(self):
+        output=io.StringIO()
+        with redirect_stdout(output): self.assertEqual(futebol.main(["preview", "--source", "fixture", "--date", "2026-07-16"]), 0)
+        self.assertIn("*Jogos em 16/07/2026*", output.getvalue()); self.assertNotIn("*Hoje no", output.getvalue())
+    def test_cli_today_usa_titulo_de_hoje(self):
+        output=io.StringIO()
+        with patch("orion_football.futebol.local_today", return_value=futebol.parse_schedule_date("2026-07-16")):
+            with redirect_stdout(output): self.assertEqual(futebol.main(["preview", "--source", "fixture", "--today"]), 0)
+        self.assertIn("*Hoje no Brasileirão*", output.getvalue()); self.assertNotIn("*Jogos em", output.getvalue())
+    def test_cli_pregame(self):
         self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23", "--minutes", "15"]), 0)
 
 if __name__ == "__main__": unittest.main()

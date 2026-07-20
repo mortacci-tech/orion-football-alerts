@@ -153,7 +153,7 @@ def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[s
         deduped.append(match)
     deduped.sort(key=lambda item: (item['round'], item['kickoff'], item['home_team'], item['away_team']))
     validate_matches(deduped)
-    return {'schema_version': 1, 'data_mode': 'fixture', 'competition': config['competition'], 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'url': source.url, 'status': source.status, 'fetched_at': source.fetched_at, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'matches': deduped}
+    return {'schema_version': 1, 'data_mode': 'fixture', 'competition': config['competition'], 'competition_display_name': config.get('competition_display_name', ''), 'season': config['season'], 'timezone': config['timezone'], 'source': {'provider': source.provider, 'url': source.url, 'status': source.status, 'fetched_at': source.fetched_at, 'raw_path': str(source.raw_path) if source.raw_path else ''}, 'matches': deduped}
 
 def build_summary(matches: list[dict[str, Any]]) -> dict[str, int]:
     return {'total_matches': len(matches), 'scheduled_matches': sum((1 for match in matches if match.get('status') == 'scheduled')), 'unscheduled_matches': sum((1 for match in matches if match.get('status') == 'unscheduled'))}
@@ -335,10 +335,10 @@ def display_competition(data: dict[str, Any]) -> str:
     return f'{display_competition_name(data).upper()} {data["season"]}'
 
 def display_competition_name(data: dict[str, Any]) -> str:
-    competition = str(data.get('competition_display_name') or data['competition']).strip()
-    if competition == 'campeonato_brasileiro_serie_a':
-        competition = 'Brasileirão'
-    return competition
+    configured_name = str(data.get('competition_display_name') or '').strip()
+    if configured_name:
+        return configured_name
+    return str(data['competition']).replace('_', ' ').strip().title()
 
 def render_match_pair(match: dict[str, Any]) -> str:
     return f"{match['home_team']} x {match['away_team']}"
