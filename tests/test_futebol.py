@@ -197,6 +197,24 @@ class FutebolTests(unittest.TestCase):
             with self.assertRaisesRegex(futebol.FutebolError, "assinatura"):
                 futebol.download_pdf_from_article(config)
 
+    def test_download_pdf_usa_fallback_oficial_quando_artigo_falha(self):
+        config = futebol.load_config()
+        configured = config["source"]["document_url"]
+        pdf_headers = types.SimpleNamespace(get=lambda key, default='': 'application/pdf', get_content_type=lambda: 'application/pdf')
+        pdf_response = types.SimpleNamespace(headers=pdf_headers, geturl=lambda: configured)
+        with patch("orion_football.futebol._download", side_effect=[futebol.FutebolError("falha TLS"), (b"%PDF-fake", pdf_response, 200)]) as download:
+            result = futebol.download_pdf_from_article(config)
+        self.assertEqual(result.requested_url, configured)
+        self.assertEqual(download.call_args_list[1].args, (configured, config, "application/pdf"))
+
+    def test_download_pdf_rejeita_fallback_fora_dos_hosts_aprovados(self):
+        config = futebol.load_config()
+        config["source"]["document_url"] = "https://example.com/tabela.pdf"
+        with patch("orion_football.futebol._download", side_effect=futebol.FutebolError("offline")) as download:
+            with self.assertRaisesRegex(futebol.FutebolError, "infraestrutura oficial"):
+                futebol.download_pdf_from_article(config)
+        self.assertEqual(download.call_count, 1)
+
     def test_normalize_real_entrega_texto_extraido_ao_parser(self):
         config = futebol.load_config(); config["source"]["min_match_count"] = 1
         extraction = futebol.PdfExtraction("linha um\nlinha dois", ("linha um", "linha dois"), 2)

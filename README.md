@@ -60,7 +60,7 @@ O arquivo [config/futebol_config.example.json](config/futebol_config.example.jso
 - `pregame_minutes`: antecedência padrão do alerta pré-jogo;
 - `data_dir`: diretório local de snapshots, estado e manifesto;
 - `alerts`: tipos de alertas locais habilitados;
-- `source`: modo, URLs oficiais, timeout, limite de download e faixa plausível de partidas.
+- `source`: modo, URL do artigo oficial, URL oficial de fallback do PDF, timeout, limite de download e faixa plausível de partidas.
 
 Os horários são preservados no timezone configurado. Campos ausentes na fonte continuam ausentes ou são marcados como não definidos; o programa não completa informações por conta própria.
 
@@ -143,7 +143,7 @@ orion-football alerts --source fixture --current --dry-run
 
 ## Fonte oficial e atualização segura
 
-A fonte primária é a Confederação Brasileira de Futebol (CBF). No modo real, o programa acessa apenas hosts CBF aprovados, localiza o PDF configurado, valida o download e extrai todas as páginas com `pypdf`. O candidato completo passa por validações de schema, duplicidade, campos essenciais e quantidade plausível antes da publicação.
+A fonte primária é a Confederação Brasileira de Futebol (CBF). No modo real, o programa acessa apenas hosts CBF aprovados, localiza o PDF no artigo oficial e, se a descoberta falhar, tenta uma única URL oficial de fallback configurada. Depois valida o download e extrai todas as páginas com `pypdf`. O candidato completo passa por validações de schema, duplicidade, campos essenciais e quantidade plausível antes da publicação.
 
 A comparação usa SHA-256 canônico sem metadados voláteis. A escrita do snapshot e do manifesto usa arquivo temporário no mesmo filesystem, `flush`, `fsync` e `os.replace`. O manifesto `brasileirao_serie_a_<ano>_real_source_manifest.json` registra URLs, HTTP, tipo de conteúdo, tamanho, hashes, páginas, quantidade de partidas, resultado e erro resumido.
 

@@ -15,6 +15,7 @@
     "provider": "CBF",
     "mode": "fixture",
     "article_url": "https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a",
+    "document_url": "https://stcbfsiteprdimgbrs.blob.core.windows.net/img-site/cdn/Tabela_Detalhada_Brasileiro_Serie_A_2026_19_a_24_rodada_82505dee72.pdf",
     "document_name_pattern": "Tabela_Detalhada.*\\.pdf",
     "timeout_seconds": 20,
     "max_download_bytes": 5000000,
