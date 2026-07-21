@@ -1,11 +1,27 @@
 .DS_Store
-**pycache**/
+
+# Python environments and caches
+.venv*/
+venv*/
+__pycache__/
 *.py[cod]
-.venv/
-venv/
-.env
-.env.*
-*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env*
+!.env.example
+secrets/
+*credential*
+
+# Runtime output and downloaded source material
 data/
 state/
 ledgers/
@@ -13,8 +29,13 @@ downloads/
 *.pdf
 *_real.json
 *_ledger.json
-secrets/
+*_source_manifest.json
 
-# Internal handoff files
-HANDOFF-PARA-CHATGPT.txt
+# Logs, temporary files, backups, and internal handoffs
+*.log
+*.tmp
+*.temp
+*.swp
+*.bak
+*.bak-*
 *HANDOFF*.txt

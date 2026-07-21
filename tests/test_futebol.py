@@ -100,6 +100,16 @@ class FutebolTests(unittest.TestCase):
     def test_cli_pregame(self):
         self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23", "--minutes", "15"]), 0)
 
+    def test_cli_pregame_usa_minutos_da_configuracao(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23"]), 0)
+        self.assertIn("Faltam 15 minutos", output.getvalue())
+
+    def test_recursos_publicos_estao_no_pacote(self):
+        self.assertTrue(futebol.CONFIG_PATH.is_file())
+        self.assertTrue(futebol.FIXTURE_PATH.is_file())
+
     def real_config(self, directory):
         config = {"schema_version": 1, "competition": "campeonato_brasileiro_serie_a", "competition_display_name": "Brasileirão", "season": 2026, "owner_team": "Flamengo", "timezone": "America/Sao_Paulo", "data_dir": str(Path(directory) / "data"), "source": {"provider": "CBF", "mode": "real", "min_match_count": 1}}
         path = Path(directory) / "config.json"; path.write_text(json.dumps(config), encoding="utf-8")

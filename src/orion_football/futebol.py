@@ -6,7 +6,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -18,12 +17,12 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
-FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
+CONFIG_PATH = BASE_DIR / 'resources' / 'futebol_config.example.json'
+FIXTURE_PATH = BASE_DIR / 'resources' / 'cbf_tabela_detalhada_sample.html'
 REAL_URL_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a'
 REAL_DOCUMENT_DEFAULT = 'https://stcbfsiteprdimgbrs.blob.core.windows.net/img-site/cdn/Tabela_Detalhada_Brasileiro_Serie_A_2026_19_a_24_rodada_82505dee72.pdf'
-DEFAULT_CONFIG_PATH = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'config.json'
-DEFAULT_DATA_DIR = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data'
+DEFAULT_CONFIG_PATH = Path.home() / '.config' / 'orion-football-alerts' / 'config.json'
+DEFAULT_DATA_DIR = Path.home() / '.local' / 'share' / 'orion-football-alerts'
 BROADCASTERS_BY_COLUMN = {'1': 'Globo', '2': 'Record', '3': 'Sportv', '4': 'Amazon', '5': 'Youtube / Cazé TV', '6': 'GE TV', '7': 'Premiere'}
 MONTHS_PT = {1: 'JANEIRO', 2: 'FEVEREIRO', 3: 'MARCO', 4: 'ABRIL', 5: 'MAIO', 6: 'JUNHO', 7: 'JULHO', 8: 'AGOSTO', 9: 'SETEMBRO', 10: 'OUTUBRO', 11: 'NOVEMBRO', 12: 'DEZEMBRO'}
 WEEKDAYS_PT = {0: 'SEGUNDA-FEIRA', 1: 'TERCA-FEIRA', 2: 'QUARTA-FEIRA', 3: 'QUINTA-FEIRA', 4: 'SEXTA-FEIRA', 5: 'SABADO', 6: 'DOMINGO'}
@@ -821,24 +820,6 @@ def render_owner_team_alert_text(config: dict[str, Any], data: dict[str, Any], r
     lines.extend(['', f"Fonte: {source.get('provider', 'CBF')}", 'Status: DRY-RUN — NÃO ENVIADO'])
     return '\n'.join(lines).strip()
 
-def find_owner_team_match(config: dict[str, Any], data: dict[str, Any], round_number: int) -> dict[str, Any]:
-    owner = config['owner_team'].casefold()
-    matches = [match for match in data['matches'] if int(match['round']) == round_number and owner in {match['home_team'].casefold(), match['away_team'].casefold()}]
-    if not matches:
-        raise FutebolError(f"Nenhum jogo do {config['owner_team']} encontrado na rodada {round_number}.")
-    return matches[0]
-
-def render_whatsapp_owner_team_message(config: dict[str, Any], data: dict[str, Any], round_number: int) -> str:
-    match = find_owner_team_match(config, data, round_number)
-    if match.get('status') == 'scheduled':
-        kickoff = datetime.fromisoformat(match['kickoff'])
-        when = f'{capitalize_pt(WEEKDAYS_PT[kickoff.weekday()])}, {kickoff:%d/%m}, às {kickoff:%Hh%M}'
-    else:
-        when = 'Data e horário ainda não definidos pela CBF'
-    location = render_location(match) or 'ainda não informado'
-    broadcast = render_broadcast(match).replace('Transmissão: ', '')
-    return '\n'.join(['🔴⚫ PRÓXIMO JOGO DO FLAMENGO', '', when, f"{match['home_team']} x {match['away_team']}", '', f'📍 {location}', f'📺 {broadcast}', '', f"Brasileirão {data['season']} — {round_number}ª rodada", 'Fonte: CBF']).strip()
-
 def load_alert_ledger(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {'schema_version': 1, 'entries': []}
@@ -954,7 +935,8 @@ def cmd_pregame(args: argparse.Namespace) -> int:
     else:
         data = load_normalized(config, args.source)
     match = select_owner_match_by_date(config, data, args.date)
-    print(render_pregame_alert(match, args.minutes))
+    minutes = args.minutes if args.minutes is not None else int(config.get('pregame_minutes', 15))
+    print(render_pregame_alert(match, minutes))
     return 0
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -996,11 +978,8 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     print(f'Alertas gerados: {len(alerts)}')
     print(f'Novos no ledger dry-run: {new_count}')
     print(f'Já existentes: {existing_count}')
-    print('WhatsApp enviado: NÃO')
+    print('Mensagens enviadas: 0')
     return 0
-
-def cmd_send(args: argparse.Namespace) -> int:
-    raise FutebolError('Envio não está disponível neste produto.')
 
 def validate_normalized_data(data: dict[str, Any]) -> None:
     if data.get('schema_version') != 1 or not isinstance(data.get('matches'), list):
@@ -1044,16 +1023,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 raise FutebolError(f'JSON normalizado inválido: {path}') from exc
             validate_normalized_data(data)
             result('OK', f'JSON real legível: {len(data["matches"])} partidas')
-        if config.get('whatsapp'):
-            raise FutebolError('configuração de WhatsApp não é permitida neste produto.')
-        result('OK', 'sem configuração de WhatsApp')
+        result('OK', 'sem integração de entrega no runtime')
         result('OK', 'diagnóstico offline; nenhuma rede acessada')
     except FutebolError as exc:
         result('ERRO', str(exc)); errors += 1
     return 1 if errors else 0
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
+    parser = argparse.ArgumentParser(description='Orion Football Alerts')
     parser.add_argument('--config', help='caminho da configuração local')
     subparsers = parser.add_subparsers(dest='command', required=True)
     fetch_parser = subparsers.add_parser('fetch')
@@ -1075,7 +1052,7 @@ def build_parser() -> argparse.ArgumentParser:
     pregame_parser = subparsers.add_parser('pregame', help='gera um alerta local pré-jogo do time favorito')
     pregame_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     pregame_parser.add_argument('--date', type=parse_schedule_date, required=True)
-    pregame_parser.add_argument('--minutes', type=int, required=True)
+    pregame_parser.add_argument('--minutes', type=int, help='antecedência; usa pregame_minutes da configuração quando omitido')
     pregame_parser.set_defaults(func=cmd_pregame)
     run_parser = subparsers.add_parser('run')
     run_parser.add_argument('--source', choices=['fixture', 'real'], required=True)
@@ -1088,15 +1065,6 @@ def build_parser() -> argparse.ArgumentParser:
     alerts_group.add_argument('--current', action='store_true')
     alerts_parser.add_argument('--dry-run', action='store_true', required=True)
     alerts_parser.set_defaults(func=cmd_alerts)
-    send_parser = subparsers.add_parser('send')
-    send_parser.add_argument('--source', choices=['real'], required=True)
-    send_group = send_parser.add_mutually_exclusive_group(required=True)
-    send_group.add_argument('--current', action='store_true')
-    send_group.add_argument('--round', type=int)
-    send_parser.add_argument('--alert-type', choices=['round_overview', 'owner_team_round'], required=True)
-    send_parser.add_argument('--self-only', action='store_true', required=True)
-    send_parser.add_argument('--confirm', required=True)
-    send_parser.set_defaults(func=cmd_send)
     return parser
 
 def main(argv: list[str] | None=None) -> int:

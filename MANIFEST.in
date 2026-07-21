@@ -1,0 +1,12 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+recursive-include config *.json
+recursive-include fixtures *.html
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include src/orion_football/resources *.json *.html
+exclude AGENTS.md
+global-exclude *.py[cod] __pycache__ .DS_Store *.bak *.bak-* *HANDOFF*.txt
