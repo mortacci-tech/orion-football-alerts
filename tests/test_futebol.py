@@ -1,5 +1,7 @@
 import copy
 import io
+import json
+import types
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -96,5 +98,47 @@ class FutebolTests(unittest.TestCase):
         self.assertIn("*Hoje no Brasileirão*", output.getvalue()); self.assertNotIn("*Jogos em", output.getvalue())
     def test_cli_pregame(self):
         self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23", "--minutes", "15"]), 0)
+
+    def real_config(self, directory):
+        config = {"schema_version": 1, "competition": "campeonato_brasileiro_serie_a", "competition_display_name": "Brasileirão", "season": 2026, "owner_team": "Flamengo", "timezone": "America/Sao_Paulo", "data_dir": str(Path(directory) / "data"), "source": {"provider": "CBF", "mode": "real"}}
+        path = Path(directory) / "config.json"; path.write_text(json.dumps(config), encoding="utf-8")
+        data = futebol.normalize_snapshot(config, futebol.fetch_fixture(config)); data["data_mode"] = "real"
+        normalized = futebol.normalized_path(config, "real"); normalized.parent.mkdir(parents=True); normalized.write_text(json.dumps(data), encoding="utf-8")
+        return config, path, normalized
+
+    def test_paths_use_configured_data_dir_without_globals(self):
+        config = {"season": 2026, "data_dir": "/tmp/orion-football-paths"}
+        self.assertEqual(futebol.normalized_path(config, "real"), Path("/tmp/orion-football-paths/normalized/brasileirao_serie_a_2026_real.json"))
+        self.assertEqual(futebol.raw_path(config, "input.pdf"), Path("/tmp/orion-football-paths/raw/input.pdf"))
+        self.assertFalse(hasattr(futebol, "NORMALIZED_DIR")); self.assertFalse(hasattr(futebol, "RAW_DIR"))
+
+    def test_doctor_and_real_commands_are_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, config_path, _ = self.real_config(directory)
+            output = io.StringIO()
+            with patch("orion_football.futebol.urlopen") as network, patch.object(futebol.sys, "version_info", (3, 11, 0)), patch.dict("sys.modules", {"pypdf": types.ModuleType("pypdf")}), redirect_stdout(output):
+                self.assertEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
+                self.assertEqual(futebol.main(["--config", str(config_path), "preview", "--source", "real", "--date", "2026-07-16"]), 0)
+                with patch("orion_football.futebol.local_today", return_value=futebol.parse_schedule_date("2026-07-16")):
+                    self.assertEqual(futebol.main(["--config", str(config_path), "preview", "--source", "real", "--today"]), 0)
+                self.assertEqual(futebol.main(["--config", str(config_path), "pregame", "--source", "real", "--date", "2026-07-23", "--minutes", "10"]), 0)
+            network.assert_not_called(); self.assertIn("JSON real legível", output.getvalue())
+
+    def test_doctor_errors_for_missing_config_json_and_invalid_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.json"
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(missing), "doctor"]), 0)
+            _, config_path, normalized = self.real_config(directory)
+            normalized.unlink()
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
+            normalized.parent.mkdir(parents=True, exist_ok=True); normalized.write_text("{invalid", encoding="utf-8")
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
+
+    def test_doctor_is_listed_in_help(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit) as exit_result: futebol.main(["--help"])
+        self.assertEqual(exit_result.exception.code, 0)
+        self.assertIn("doctor", output.getvalue())
 
 if __name__ == "__main__": unittest.main()

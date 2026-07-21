@@ -29,6 +29,12 @@ pip install -r requirements.txt
 
 Copie `config/futebol_config.example.json` para um arquivo local ignorado pelo Git e ajuste a fonte e `competition_display_name` conforme os termos do provedor. A primeira versão pública usa fixture; nenhuma credencial é necessária.
 
+O comando instalado é `orion-football`. Por padrão ele lê
+`~/Library/Application Support/Orion Football/config.json`; use `--config` ou
+`ORION_FOOTBALL_CONFIG` para outra configuração. Os JSONs normalizados ficam em
+`data_dir/normalized/`. `orion-football doctor` é estritamente offline: valida
+a configuração e, no modo `real`, apenas lê o JSON local já normalizado.
+
 ## Comandos usando fixture
 
 ```bash

@@ -18,9 +18,8 @@ from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
-ALERT_LEDGER_PATH = BASE_DIR.parent.parent / 'state' / 'alerts.json'
-ALERTS_PLAN_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_plan.json'
-ALERTS_PREVIEW_PATH = BASE_DIR.parent.parent / 'state' / 'alerts_preview.txt'
+DEFAULT_CONFIG_PATH = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'config.json'
+DEFAULT_DATA_DIR = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data'
 BROADCASTERS_BY_COLUMN = {'1': 'Globo', '2': 'Record', '3': 'Sportv', '4': 'Amazon', '5': 'Youtube / Cazé TV', '6': 'GE TV', '7': 'Premiere'}
 MONTHS_PT = {1: 'JANEIRO', 2: 'FEVEREIRO', 3: 'MARCO', 4: 'ABRIL', 5: 'MAIO', 6: 'JUNHO', 7: 'JULHO', 8: 'AGOSTO', 9: 'SETEMBRO', 10: 'OUTUBRO', 11: 'NOVEMBRO', 12: 'DEZEMBRO'}
 WEEKDAYS_PT = {0: 'SEGUNDA-FEIRA', 1: 'TERCA-FEIRA', 2: 'QUARTA-FEIRA', 3: 'QUINTA-FEIRA', 4: 'SEXTA-FEIRA', 5: 'SABADO', 6: 'DOMINGO'}
@@ -37,18 +36,74 @@ class SourceSnapshot:
     html_text: str
     raw_path: Path | None
 
-def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise FutebolError(f'Configuração não encontrada: {CONFIG_PATH}')
-    return json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+def resolve_config_path(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    if os.environ.get('ORION_FOOTBALL_CONFIG'):
+        return Path(os.environ['ORION_FOOTBALL_CONFIG']).expanduser()
+    return DEFAULT_CONFIG_PATH
 
-def ensure_dirs() -> None:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)
+def data_dir(config: dict[str, Any]) -> Path:
+    return Path(config.get('data_dir') or DEFAULT_DATA_DIR).expanduser()
 
-def ensure_alert_dirs() -> None:
-    ALERTS_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+def raw_path(config: dict[str, Any], name: str) -> Path:
+    return data_dir(config) / 'raw' / name
+
+def normalized_path(config: dict[str, Any], source: str='fixture') -> Path:
+    suffix = 'real' if source == 'real' else 'fixture'
+    return data_dir(config) / 'normalized' / f"brasileirao_serie_a_{config['season']}_{suffix}.json"
+
+def alert_paths(config: dict[str, Any]) -> tuple[Path, Path, Path]:
+    state_dir = data_dir(config) / 'state'
+    return state_dir / 'alerts.json', state_dir / 'alerts_plan.json', state_dir / 'alerts_preview.txt'
+
+def validate_config(config: dict[str, Any]) -> None:
+    if config.get('schema_version', 1) != 1:
+        raise FutebolError('schema_version deve ser 1.')
+    if not str(config.get('owner_team', '')).strip():
+        raise FutebolError('owner_team não pode ser vazio.')
+    try:
+        season = int(config.get('season'))
+    except (TypeError, ValueError) as exc:
+        raise FutebolError('season deve ser um ano válido.') from exc
+    if not 1900 <= season <= 2100:
+        raise FutebolError('season deve estar entre 1900 e 2100.')
+    try:
+        ZoneInfo(str(config.get('timezone', '')))
+    except Exception as exc:
+        raise FutebolError(f'timezone inválido: {config.get("timezone")}') from exc
+    source = config.get('source')
+    if not isinstance(source, dict):
+        raise FutebolError('source deve ser um objeto de configuração.')
+    mode = source.get('mode', 'fixture')
+    if mode not in {'fixture', 'real'}:
+        raise FutebolError('source.mode deve ser fixture ou real.')
+
+def load_config(path: str | Path | None = None, *, require: bool = False) -> dict[str, Any]:
+    config_path = resolve_config_path(path)
+    if not config_path.exists():
+        if require:
+            raise FutebolError(f'Configuração não encontrada: {config_path}')
+        if not CONFIG_PATH.exists():
+            raise FutebolError(f'Configuração não encontrada: {config_path}')
+        config = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+        config.setdefault('schema_version', 1)
+        config.setdefault('data_dir', str(DEFAULT_DATA_DIR))
+        config['source'] = {**config.get('source', {}), 'mode': 'fixture'}
+    else:
+        try:
+            config = json.loads(config_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise FutebolError(f'Configuração inválida: {config_path}') from exc
+    validate_config(config)
+    return config
+
+def ensure_dirs(config: dict[str, Any]) -> None:
+    (data_dir(config) / 'raw').mkdir(parents=True, exist_ok=True)
+    (data_dir(config) / 'normalized').mkdir(parents=True, exist_ok=True)
+
+def ensure_alert_dirs(config: dict[str, Any]) -> None:
+    (data_dir(config) / 'state').mkdir(parents=True, exist_ok=True)
 
 def now_iso(tz_name: str) -> str:
     return datetime.now(ZoneInfo(tz_name)).isoformat(timespec='seconds')
@@ -187,21 +242,17 @@ def validate_matches(matches: list[dict[str, Any]]) -> None:
 def match_sort_key(match: dict[str, Any]) -> tuple[Any, ...]:
     return (int(match['round']), match.get('kickoff') or '9999-12-31T23:59:59-03:00', match['home_team'], match['away_team'])
 
-def normalized_path(config: dict[str, Any], source: str='fixture') -> Path:
-    suffix = 'real' if source == 'real' else 'fixture'
-    return NORMALIZED_DIR / f"brasileirao_serie_a_{config['season']}_{suffix}.json"
-
 def write_normalized(config: dict[str, Any], data: dict[str, Any], source: str='fixture') -> Path:
-    ensure_dirs()
+    ensure_dirs(config)
     path = normalized_path(config, source)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return path
 
-def write_fixture_raw(snapshot: SourceSnapshot) -> Path:
-    ensure_dirs()
-    raw_path = RAW_DIR / 'cbf_tabela_detalhada_fixture.html'
-    raw_path.write_text(snapshot.html_text, encoding='utf-8')
-    return raw_path
+def write_fixture_raw(config: dict[str, Any], snapshot: SourceSnapshot) -> Path:
+    ensure_dirs(config)
+    path = raw_path(config, 'cbf_tabela_detalhada_fixture.html')
+    path.write_text(snapshot.html_text, encoding='utf-8')
+    return path
 
 def load_normalized(config: dict[str, Any], source: str='fixture') -> dict[str, Any]:
     path = normalized_path(config, source)
@@ -220,7 +271,7 @@ def choose_current_round(matches: list[dict[str, Any]], tz_name: str, now: datet
             return round_number
     return rounds[-1]
 
-def render_preview(data: dict[str, Any], round_number: int | None=None, current: bool=False) -> str:
+def render_preview(data: dict[str, Any], round_number: int | None=None, current: bool=False, config: dict[str, Any] | None=None) -> str:
     matches = data['matches']
     if current:
         round_number = choose_current_round(matches, data['timezone'])
@@ -229,7 +280,7 @@ def render_preview(data: dict[str, Any], round_number: int | None=None, current:
     round_matches = [match for match in matches if int(match['round']) == round_number]
     if not round_matches:
         raise FutebolError(f'Rodada não encontrada: {round_number}')
-    owner_team = load_config()['owner_team']
+    owner_team = (config or load_config())['owner_team']
     if data.get('data_mode') == 'real':
         source = data.get('source', {})
         lines = ['FONTE REAL VALIDADA — CBF', f'Fonte: CBF', f"Última atualização da fonte: {source.get('fetched_at', 'não informada')}", '', f"BRASILEIRÃO {data['season']} — RODADA {round_number}", '']
@@ -338,6 +389,8 @@ def display_competition_name(data: dict[str, Any]) -> str:
     configured_name = str(data.get('competition_display_name') or '').strip()
     if configured_name:
         return configured_name
+    if data['competition'] == 'campeonato_brasileiro_serie_a':
+        return 'Brasileirão'
     return str(data['competition']).replace('_', ' ').strip().title()
 
 def render_match_pair(match: dict[str, Any]) -> str:
@@ -468,7 +521,7 @@ def render_whatsapp_owner_team_message(config: dict[str, Any], data: dict[str, A
     broadcast = render_broadcast(match).replace('Transmissão: ', '')
     return '\n'.join(['🔴⚫ PRÓXIMO JOGO DO FLAMENGO', '', when, f"{match['home_team']} x {match['away_team']}", '', f'📍 {location}', f'📺 {broadcast}', '', f"Brasileirão {data['season']} — {round_number}ª rodada", 'Fonte: CBF']).strip()
 
-def load_alert_ledger(path: Path=ALERT_LEDGER_PATH) -> dict[str, Any]:
+def load_alert_ledger(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {'schema_version': 1, 'entries': []}
     try:
@@ -491,7 +544,7 @@ def write_text_atomic(path: Path, text: str) -> None:
     tmp_path.write_text(text, encoding='utf-8')
     os.replace(tmp_path, path)
 
-def update_alert_ledger(alerts: list[dict[str, Any]], observed_at: str, path: Path=ALERT_LEDGER_PATH) -> tuple[dict[str, Any], int, int]:
+def update_alert_ledger(alerts: list[dict[str, Any]], observed_at: str, path: Path) -> tuple[dict[str, Any], int, int]:
     ledger = load_alert_ledger(path)
     by_key = {(entry['alert_id'], entry['execution_mode']): entry for entry in ledger['entries']}
     new_count = 0
@@ -547,10 +600,10 @@ def capitalize_pt(value: str) -> str:
     return value[:1].upper() + value[1:].lower()
 
 def cmd_normalize(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(args.config)
     if args.source == 'fixture':
         snapshot = fetch_fixture(config)
-        write_fixture_raw(snapshot)
+        write_fixture_raw(config, snapshot)
         data = normalize_snapshot(config, snapshot)
         path = write_normalized(config, data, 'fixture')
     else:
@@ -562,15 +615,15 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     return 0
 
 def cmd_fetch(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(args.config)
     if args.source != 'fixture':
         raise FutebolError('fetch real não é suportado; use normalize --source real.')
-    path = write_fixture_raw(fetch_fixture(config))
+    path = write_fixture_raw(config, fetch_fixture(config))
     print(f'Fixture salva em: {path}')
     return 0
 
 def cmd_preview(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(args.config)
     if args.source == 'fixture':
         data = normalize_snapshot(config, fetch_fixture(config))
     else:
@@ -583,7 +636,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 def cmd_pregame(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = load_config(args.config)
     if args.source == 'fixture':
         data = normalize_snapshot(config, fetch_fixture(config))
     else:
@@ -595,10 +648,10 @@ def cmd_pregame(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         raise FutebolError('--dry-run é obrigatório nesta fase.')
-    config = load_config()
+    config = load_config(args.config)
     if args.source == 'fixture':
         snapshot = fetch_fixture(config)
-        write_fixture_raw(snapshot)
+        write_fixture_raw(config, snapshot)
         data = normalize_snapshot(config, snapshot)
         path = write_normalized(config, data, 'fixture')
     else:
@@ -613,20 +666,21 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_alerts(args: argparse.Namespace) -> int:
     if not args.dry_run:
         raise FutebolError('--dry-run é obrigatório para alertas nesta missão.')
-    config = load_config()
+    config = load_config(args.config)
     data = load_normalized(config, args.source)
     generated_at = now_iso(config['timezone'])
     alerts = build_alerts(config, data, round_number=args.round, current=args.current, generated_at=generated_at)
     if not alerts:
         raise FutebolError('Nenhum alerta habilitado na configuração.')
-    ensure_alert_dirs()
-    (_, new_count, existing_count) = update_alert_ledger(alerts, generated_at)
+    ensure_alert_dirs(config)
+    ledger_path, plan_path, preview_path = alert_paths(config)
+    (_, new_count, existing_count) = update_alert_ledger(alerts, generated_at, ledger_path)
     plan = build_alerts_plan(config, data, alerts, new_count, existing_count)
-    write_json_atomic(ALERTS_PLAN_PATH, plan)
-    write_text_atomic(ALERTS_PREVIEW_PATH, render_alerts_preview(alerts))
-    print(f'Plano salvo em: {ALERTS_PLAN_PATH}')
-    print(f'Preview salvo em: {ALERTS_PREVIEW_PATH}')
-    print(f'Ledger salvo em: {ALERT_LEDGER_PATH}')
+    write_json_atomic(plan_path, plan)
+    write_text_atomic(preview_path, render_alerts_preview(alerts))
+    print(f'Plano salvo em: {plan_path}')
+    print(f'Preview salvo em: {preview_path}')
+    print(f'Ledger salvo em: {ledger_path}')
     print(f'Alertas gerados: {len(alerts)}')
     print(f'Novos no ledger dry-run: {new_count}')
     print(f'Já existentes: {existing_count}')
@@ -636,12 +690,65 @@ def cmd_alerts(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     raise FutebolError('Envio não está disponível neste produto.')
 
+def validate_normalized_data(data: dict[str, Any]) -> None:
+    if data.get('schema_version') != 1 or not isinstance(data.get('matches'), list):
+        raise FutebolError('JSON normalizado possui schema mínimo inválido.')
+    validate_matches(data['matches'])
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    errors = 0
+    def result(status: str, message: str) -> None:
+        print(f'{status}: {message}')
+    result('OK' if sys.version_info >= (3, 11) else 'ERRO', f'Python {sys.version_info[0]}.{sys.version_info[1]}')
+    errors += int(sys.version_info < (3, 11))
+    try:
+        import orion_football  # noqa: F401
+        result('OK', 'pacote orion_football carregado')
+    except ImportError:
+        result('ERRO', 'pacote orion_football não pôde ser carregado'); errors += 1
+    try:
+        import pypdf  # noqa: F401
+        result('OK', 'pypdf importado')
+    except ImportError:
+        result('ERRO', 'pypdf não está instalado'); errors += 1
+    try:
+        config_path = resolve_config_path(args.config)
+        config = load_config(config_path, require=True)
+        result('OK', f'configuração legível: {config_path}')
+        result('OK', f'owner_team: {config["owner_team"]}')
+        result('OK', f'timezone: {config["timezone"]}')
+        result('OK', f'season: {config["season"]}')
+        source_mode = config['source'].get('mode', 'fixture')
+        result('OK', f'modo da fonte: {source_mode}')
+        result('OK', f'diretório de dados: {data_dir(config)}')
+        path = normalized_path(config, source_mode)
+        result('OK', f'JSON normalizado: {path}')
+        if source_mode == 'real':
+            if not path.is_file():
+                raise FutebolError(f'JSON normalizado não encontrado: {path}')
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise FutebolError(f'JSON normalizado inválido: {path}') from exc
+            validate_normalized_data(data)
+            result('OK', f'JSON real legível: {len(data["matches"])} partidas')
+        if config.get('whatsapp'):
+            raise FutebolError('configuração de WhatsApp não é permitida neste produto.')
+        result('OK', 'sem configuração de WhatsApp')
+        result('OK', 'diagnóstico offline; nenhuma rede acessada')
+    except FutebolError as exc:
+        result('ERRO', str(exc)); errors += 1
+    return 1 if errors else 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Módulo Futebol Orion 2.0')
+    parser.add_argument('--config', help='caminho da configuração local')
     subparsers = parser.add_subparsers(dest='command', required=True)
     fetch_parser = subparsers.add_parser('fetch')
     fetch_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     fetch_parser.set_defaults(func=cmd_fetch)
+    doctor_parser = subparsers.add_parser('doctor', help='valida a instalação e os dados locais sem acessar rede')
+    doctor_parser.set_defaults(func=cmd_doctor)
     normalize_parser = subparsers.add_parser('normalize')
     normalize_parser.add_argument('--source', choices=['fixture', 'real'], default='fixture')
     normalize_parser.set_defaults(func=cmd_normalize)

@@ -1,10 +1,13 @@
 {
+  "schema_version": 1,
   "competition": "campeonato_brasileiro_serie_a",
   "competition_display_name": "Brasileirão",
   "season": 2026,
   "owner_team": "Flamengo",
   "timezone": "America/Sao_Paulo",
+  "data_dir": "~/Library/Application Support/Orion Football/data",
   "source": {
-    "provider": "CBF"
+    "provider": "CBF",
+    "mode": "fixture"
   }
 }
