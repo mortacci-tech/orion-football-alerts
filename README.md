@@ -35,6 +35,12 @@ python -m pip install .
 
 O entrypoint instalado é `orion-football`. `requirements.txt` espelha apenas a dependência de runtime para fluxos que exigem esse formato; a instalação normal é `pip install .`.
 
+### Instalação dentro de um agente
+
+Para conectar o módulo a OpenClaw, outro agente local, WhatsApp ou um agendador, siga o guia completo em [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md). O guia explica instalação, configuração, atualização da fonte oficial, captura segura da saída, prevenção de duplicidades e o contrato mínimo de integração.
+
+O repositório entrega o motor de futebol. Credenciais, destinatários, agendamento e envio de mensagens permanecem no ambiente privado de cada agente.
+
 ## Início rápido
 
 Crie uma configuração local a partir do exemplo seguro:
@@ -153,7 +159,8 @@ A comparação usa SHA-256 canônico sem metadados voláteis. A escrita do snaps
 - `config/`: configuração de exemplo;
 - `fixtures/`: amostra pública usada em testes offline;
 - `tests/`: suíte `unittest` determinística;
-- `docs/ARCHITECTURE.md`: fluxo de dados e limites do runtime.
+- `docs/ARCHITECTURE.md`: fluxo de dados e limites do runtime;
+- `docs/AGENT_INTEGRATION.md`: instalação e integração segura com agentes e mensageria.
 
 O pacote é independente: configuração, dados, estado e ledger ficam no diretório escolhido pelo usuário. Veja [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) para o fluxo resumido.
 
