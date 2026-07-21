@@ -1,10 +1,16 @@
 {
   "schema_version": 1,
   "competition": "campeonato_brasileiro_serie_a",
+  "competition_display_name": "Brasileirão",
   "season": 2026,
   "owner_team": "Flamengo",
   "timezone": "America/Sao_Paulo",
-  "data_dir": "~/Library/Application Support/Orion Football/data",
+  "pregame_minutes": 15,
+  "data_dir": "~/.local/share/orion-football-alerts",
+  "alerts": {
+    "round_overview": {"enabled": true},
+    "owner_team_round": {"enabled": true}
+  },
   "source": {
     "provider": "CBF",
     "mode": "fixture",
@@ -13,14 +19,8 @@
     "document_name_pattern": "Tabela_Detalhada.*\\.pdf",
     "timeout_seconds": 20,
     "max_download_bytes": 5000000,
+    "min_match_count": 10,
+    "max_match_count": 1000,
     "user_agent": "orion-football-alerts/0.1 (official CBF source reader)"
-  },
-  "alerts": {
-    "round_overview": {
-      "enabled": true
-    },
-    "owner_team_round": {
-      "enabled": true
-    }
   }
 }

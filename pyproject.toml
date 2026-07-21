@@ -1,22 +1,33 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "orion-football-alerts"
 version = "0.1.0"
-description = "Alertas determinísticos de futebol"
+description = "Alertas determinísticos de futebol a partir da fonte oficial da CBF"
+readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pypdf==6.12.1"]
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["pypdf>=5,<7"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/mortacci-tech/orion-football-alerts"
+Issues = "https://github.com/mortacci-tech/orion-football-alerts/issues"
 
 [project.scripts]
 orion-football = "orion_football.futebol:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
 [tool.setuptools.package-data]
-orion_football = ["fixtures/*.html", "fixtures/*.txt", "config/*.json"]
+orion_football = ["resources/*.json", "resources/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

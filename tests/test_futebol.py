@@ -1,24 +1,35 @@
 import copy
+import hashlib
 import io
+import json
+import types
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from orion_football import futebol
 
 class FutebolTests(unittest.TestCase):
     def data(self):
         c=futebol.load_config(); return c, futebol.normalize_snapshot(c, futebol.fetch_fixture(c))
+    def favorite_day_with_others(self):
+        c,d=self.data(); d=copy.deepcopy(d)
+        favorite=next(m for m in d["matches"] if "Flamengo" in (m["home_team"], m["away_team"]))
+        early=copy.deepcopy(next(m for m in d["matches"] if m["home_team"]=="Botafogo"))
+        late=copy.deepcopy(next(m for m in d["matches"] if m["home_team"]=="Mirassol"))
+        favorite.update(home_team="Flamengo", away_team="Adversário", schedule_date="2026-07-23", schedule_time="20:00", broadcasters=["Globo", "Premiere"])
+        early.update(home_team="Time A", away_team="Time B", schedule_date="2026-07-23", schedule_time="19:30", broadcasters=[])
+        late.update(home_team="Time C", away_team="Time D", schedule_date="2026-07-23", schedule_time="21:30", broadcasters=[])
+        d["matches"]=[late, favorite, early]
+        return c,d
     def test_fixture_normalizada(self):
         _,d=self.data(); self.assertEqual(d["data_mode"],"fixture"); self.assertEqual({m["round"] for m in d["matches"]},{19,20})
     def test_time_e_timezone(self):
         _,d=self.data(); self.assertTrue(datetime.fromisoformat(d["matches"][0]["kickoff"]).tzinfo)
-    def test_duplicidade_falha(self):
-        c,d=self.data(); html=futebol.FIXTURE_PATH.read_text(); row='<tr><td>Ref: 181 Rodada: 19</td><td>x</td><td>Botafogo x Santos</td><td>Data: 16/07/2026 - quinta-feira às 19h30 Local: Nilton Santos - Rio de Janeiro - RJ</td><td>Transmissão: SporTV / Premiere</td></tr>'; s=futebol.SourceSnapshot("CBF","fixture","fixture",futebol.now_iso(c["timezone"]),html.replace("</tbody>",row+"</tbody>"),None)
-        with self.assertRaisesRegex(futebol.FutebolError, 'duplicada'):
-            futebol.normalize_snapshot(c,s)
+    def test_deduplicacao(self):
+        c,d=self.data(); html=futebol.FIXTURE_PATH.read_text(); row='<tr><td>Ref: 181 Rodada: 19</td><td>x</td><td>Botafogo x Santos</td><td>Data: 16/07/2026 - quinta-feira às 19h30 Local: Nilton Santos - Rio de Janeiro - RJ</td><td>Transmissão: SporTV / Premiere</td></tr>'; s=futebol.SourceSnapshot("CBF","fixture","fixture",futebol.now_iso(c["timezone"]),html.replace("</tbody>",row+"</tbody>"),None); self.assertEqual(sum(m["reference"]=="181" for m in futebol.normalize_snapshot(c,s)["matches"]),1)
     def test_preview_owner(self):
         c,d=self.data(); p=futebol.render_preview(d,round_number=19); self.assertIn("JOGO DO FLAMENGO",p); self.assertIn("São Paulo x Flamengo",p)
     def test_alerta_idempotente(self):
@@ -27,23 +38,20 @@ class FutebolTests(unittest.TestCase):
             p=Path(x)/"ledger.json"; _,n,e=futebol.update_alert_ledger(a,"2026-07-17T00:00:00-03:00",p); _,n2,e2=futebol.update_alert_ledger(a,"2026-07-17T01:00:00-03:00",p); self.assertEqual((n,e,n2,e2),(2,0,0,2))
     def test_sem_internet(self):
         c,d=self.data();
-        with patch("urllib.request.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
+        with patch("orion_football.futebol.urlopen") as u: futebol.build_alerts(c,d,19); u.assert_not_called()
     def test_preview_data_com_multiplos_jogos_e_ordem(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16")
-        self.assertIn("⚽ JOGOS DE 16/07/2026",p)
-        self.assertNotIn("HOJE",p)
-        self.assertIn("19h30 — Botafogo x Santos",p)
-        self.assertIn("19h30 — Vitória x Vasco da Gama",p)
+        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n*Jogos em 16/07/2026*\n\nBotafogo x Santos · 19h30\nVitória x Vasco da Gama · 19h30\nMirassol x Grêmio · 20h00")
         self.assertLess(p.index("Botafogo"),p.index("Vitória"))
         self.assertNotIn("Fonte: CBF",p)
+        self.assertNotIn("Nilton Santos",p)
     def test_preview_destaca_favorito(self):
-        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23")
-        self.assertTrue(p.startswith("🔴⚫ FLAMENGO EM 23/07/2026"))
-        self.assertIn("20h00 — Flamengo x Botafogo",p)
-        self.assertIn("📍 Maracanã — Rio de Janeiro/RJ",p)
-        self.assertIn("📺 Globo, Premiere",p)
+        c,d=self.favorite_day_with_others(); p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
+        self.assertEqual(p, "🏆 *BRASILEIRÃO 2026*\n\n🔴⚫ *Hoje tem Flamengo*\n\nFlamengo x Adversário\n20h00\n\n📺 Globo e Premiere\n\n*Outros jogos de hoje*\n\nTime A x Time B · 19h30\nTime C x Time D · 21h30")
+        self.assertEqual(p.count("Flamengo x Adversário"), 1)
+        self.assertLess(p.index("Time A"), p.index("Time C")); self.assertNotIn("Local:", p); self.assertNotIn("Fonte:", p); self.assertNotIn("\n\n\n", p)
     def test_preview_data_sem_jogos(self):
-        c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ NÃO HÁ JOGOS EM 22/07/2026")
+        c,d=self.data(); self.assertEqual(futebol.render_daily_preview(c,d,"2026-07-22"),"⚽ Não há jogos no BRASILEIRÃO 2026 em 22/07/2026.")
     def test_data_invalida(self):
         with self.assertRaises(futebol.FutebolError): futebol.parse_schedule_date("22/07/2026")
     def test_today_com_relogio_injetado(self):
@@ -55,216 +63,283 @@ class FutebolTests(unittest.TestCase):
         self.assertNotIn("📍",p); self.assertNotIn("📺",p)
     def test_preview_today_usa_hoje(self):
         c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
-        self.assertTrue(p.startswith("🔴⚫ HOJE TEM FLAMENGO"))
+        self.assertIn("*Hoje tem Flamengo*", p)
+    def test_preview_today_sem_favorito(self):
+        c,d=self.data(); p=futebol.render_daily_preview(c,d,"2026-07-16",today=True)
+        self.assertIn("*Hoje no Brasileirão*", p)
+    def test_favorito_sem_transmissao_e_sem_outros_jogos(self):
+        c,d=self.data(); d=copy.deepcopy(d)
+        matches=[m for m in d["matches"] if m["schedule_date"]=="2026-07-23"]
+        for match in matches:
+            if "Flamengo" in (match["home_team"], match["away_team"]): match["broadcasters"]=[]
+        d["matches"]=[m for m in d["matches"] if m not in matches or "Flamengo" in (m["home_team"], m["away_team"])]
+        p=futebol.render_daily_preview(c,d,"2026-07-23",today=True)
+        self.assertNotIn("📺", p); self.assertNotIn("Outros jogos", p); self.assertNotIn("\n\n\n", p)
+    def test_competicao_e_time_favorito_parametrizados(self):
+        c,d=self.data(); c["owner_team"]="Botafogo"; d=copy.deepcopy(d); d["competition"]="copa_exemplo"; d["competition_display_name"]="Copa Exemplo"
+        p=futebol.render_daily_preview(c,d,"2026-07-16",today=True)
+        self.assertIn("🏆 *COPA EXEMPLO 2026*", p); self.assertIn("*Hoje tem Botafogo*", p); self.assertNotIn("Flamengo", p)
+    def test_pregame_minutos_parametrizados(self):
+        c,d=self.data(); match=futebol.select_owner_match_by_date(c,d,"2026-07-23")
+        p=futebol.render_pregame_alert(match, 25)
+        self.assertEqual(p, "⏰ *Faltam 25 minutos*\n\nFlamengo x Botafogo\n20h00\n\n📺 Globo e Premiere")
+        self.assertNotIn("Começa às", p); self.assertNotIn("Maracanã", p); self.assertNotIn("Fonte", p)
+    def test_pregame_sem_transmissao_e_minutos_invalidos(self):
+        c,d=self.data(); match=copy.deepcopy(futebol.select_owner_match_by_date(c,d,"2026-07-23")); match["broadcasters"]=[]
+        self.assertNotIn("📺", futebol.render_pregame_alert(match, 5))
+        with self.assertRaises(futebol.FutebolError): futebol.render_pregame_alert(match, -1)
+    def test_cli_date_usa_titulo_de_data(self):
+        output=io.StringIO()
+        with redirect_stdout(output): self.assertEqual(futebol.main(["preview", "--source", "fixture", "--date", "2026-07-16"]), 0)
+        self.assertIn("*Jogos em 16/07/2026*", output.getvalue()); self.assertNotIn("*Hoje no", output.getvalue())
+    def test_cli_today_usa_titulo_de_hoje(self):
+        output=io.StringIO()
+        with patch("orion_football.futebol.local_today", return_value=futebol.parse_schedule_date("2026-07-16")):
+            with redirect_stdout(output): self.assertEqual(futebol.main(["preview", "--source", "fixture", "--today"]), 0)
+        self.assertIn("*Hoje no Brasileirão*", output.getvalue()); self.assertNotIn("*Jogos em", output.getvalue())
+    def test_cli_pregame(self):
+        self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23", "--minutes", "15"]), 0)
 
-    def run_cli(self, *argv):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            try:
-                code = futebol.main(list(argv))
-            except SystemExit as exc:
-                code = exc.code
-        return code, stdout.getvalue(), stderr.getvalue()
+    def test_cli_pregame_usa_minutos_da_configuracao(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(futebol.main(["pregame", "--source", "fixture", "--date", "2026-07-23"]), 0)
+        self.assertIn("Faltam 15 minutos", output.getvalue())
 
-    def test_parser_cria_cli_sem_erro(self):
-        parser = futebol.build_parser()
-        self.assertIsNotNone(parser)
-        self.assertEqual(parser.parse_args(["normalize"]).command, "normalize")
+    def test_recursos_publicos_estao_no_pacote(self):
+        self.assertTrue(futebol.CONFIG_PATH.is_file())
+        self.assertTrue(futebol.FIXTURE_PATH.is_file())
 
-    def test_comando_fetch_nao_existe(self):
-        code, _, error = self.run_cli("fetch")
-        self.assertNotEqual(code, 0)
-        self.assertIn("invalid choice", error)
+    def real_config(self, directory):
+        config = {"schema_version": 1, "competition": "campeonato_brasileiro_serie_a", "competition_display_name": "Brasileirão", "season": 2026, "owner_team": "Flamengo", "timezone": "America/Sao_Paulo", "data_dir": str(Path(directory) / "data"), "source": {"provider": "CBF", "mode": "real", "min_match_count": 1}}
+        path = Path(directory) / "config.json"; path.write_text(json.dumps(config), encoding="utf-8")
+        data = futebol.normalize_snapshot(config, futebol.fetch_fixture(config)); data["data_mode"] = "real"
+        normalized = futebol.normalized_path(config, "real"); normalized.parent.mkdir(parents=True); normalized.write_text(json.dumps(data), encoding="utf-8")
+        return config, path, normalized
 
-    def test_comando_send_nao_existe(self):
-        code, _, error = self.run_cli("send")
-        self.assertNotEqual(code, 0)
-        self.assertIn("invalid choice", error)
+    def test_paths_use_configured_data_dir_without_globals(self):
+        config = {"season": 2026, "data_dir": "/tmp/orion-football-paths"}
+        self.assertEqual(futebol.normalized_path(config, "real"), Path("/tmp/orion-football-paths/normalized/brasileirao_serie_a_2026_real.json"))
+        self.assertEqual(futebol.raw_path(config, "input.pdf"), Path("/tmp/orion-football-paths/raw/input.pdf"))
+        self.assertFalse(hasattr(futebol, "NORMALIZED_DIR")); self.assertFalse(hasattr(futebol, "RAW_DIR"))
 
-    def test_source_real_aceito(self):
-        self.assertEqual(futebol.build_parser().parse_args(["normalize", "--source", "real"]).source, "real")
-
-    def test_fixture_eh_padrao(self):
-        self.assertEqual(futebol.build_parser().parse_args(["normalize"]).source, "fixture")
-
-    def test_hash_e_metadados_fixture(self):
-        c, d = self.data()
-        self.assertEqual(d['source']['provider'], 'CBF')
-        self.assertTrue(d['source']['source_url'])
-        self.assertEqual(len(d['source']['document_sha256']), 64)
-        self.assertTrue(d['source']['captured_at'])
-
-    def test_parser_amostra_oficial_congelada(self):
-        c = futebol.load_config()
-        sample = Path(futebol.BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_oficial_sample.html').read_text()
-        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), sample, None)
-        data = futebol.normalize_snapshot(c, source)
-        self.assertEqual(data['data_mode'], 'real')
-        self.assertEqual(len(data['matches']), 2)
-
-    def test_tabela_completa_extrai_campos_e_ignora_imagens(self):
-        c = futebol.load_config()
-        sample = '<table><tr><td>Ref: 901 Rodada: 2</td><td>1 x 0</td><td><img alt="escudo mandante">Botafogo x <img alt="escudo visitante">Santos</td><td>Data: 28/01/2026 - quarta-feira às 19h00 Local: Beira-Rio - Porto Alegre - RS</td><td>Transmissão: Globo, Premiere</td></tr></table>'
-        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), sample, None)
-        match = futebol.normalize_snapshot(c, source)['matches'][0]
-        self.assertEqual((match['reference'], match['round']), ('901', 2))
-        self.assertEqual((match['home_team'], match['away_team']), ('Botafogo', 'Santos'))
-        self.assertEqual((match['schedule_date'], match['schedule_time']), ('2026-01-28', '19:00'))
-        self.assertEqual((match['venue'], match['city'], match['state']), ('Beira-Rio', 'Porto Alegre', 'RS'))
-        self.assertEqual(match['broadcasters'], ['Globo', 'Premiere'])
-
-    def test_tabela_completa_rejeita_zero_partidas(self):
-        c = futebol.load_config()
-        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), '<table><tr><td>Jogo</td></tr></table>', None)
-        with self.assertRaisesRegex(futebol.FutebolError, 'Nenhuma linha'):
-            futebol.normalize_snapshot(c, source)
-
-    def test_estrutura_real_nao_reconhecida_falha(self):
-        c = futebol.load_config()
-        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), '<html>sem tabela</html>', None)
-        with self.assertRaises(futebol.FutebolError): futebol.normalize_snapshot(c, source)
-
-    def test_download_rejeita_http_e_vazio(self):
-        c = futebol.load_config(); c['source']['official_url'] = futebol.REAL_URL_DEFAULT
-        with patch('urllib.request.urlopen', side_effect=futebol.urllib.error.HTTPError(futebol.REAL_URL_DEFAULT, 503, 'down', {}, io.BytesIO())):
-            with self.assertRaisesRegex(futebol.FutebolError, 'HTTP 503'): futebol.fetch_real(c)
-
-    def test_download_usa_timeout_e_rejeita_vazio(self):
-        c = futebol.load_config()
-        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'text/html'})(), 'read': lambda self, n: b'', 'getcode': lambda self: 200, '__enter__': lambda self: self, '__exit__': lambda *args: None})()
-        with patch('urllib.request.urlopen', return_value=response) as mocked:
-            with self.assertRaisesRegex(futebol.FutebolError, 'vazia'): futebol.fetch_real(c)
-        self.assertEqual(mocked.call_args.kwargs['timeout'], 20.0)
-
-    def real_source(self):
-        c = futebol.load_config()
-        sample = Path(futebol.BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_oficial_sample.html').read_text()
-        return c, futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), sample, None)
-
-    def test_download_rejeita_tipo_inesperado(self):
-        c = futebol.load_config()
-        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'application/pdf'})(), '__enter__': lambda self: self, '__exit__': lambda *args: None})()
-        with patch('urllib.request.urlopen', return_value=response):
-            with self.assertRaisesRegex(futebol.FutebolError, 'Tipo de conteúdo'): futebol.fetch_real(c)
-
-    def test_download_rejeita_tamanho_maximo(self):
-        c = futebol.load_config(); c['source']['max_download_bytes'] = 3
-        response = type('Response', (), {'status': 200, 'headers': type('Headers', (), {'get_content_type': lambda self: 'text/html'})(), 'read': lambda self, n: b'abcd', '__enter__': lambda self: self, '__exit__': lambda *args: None})()
-        with patch('urllib.request.urlopen', return_value=response):
-            with self.assertRaisesRegex(futebol.FutebolError, 'limite'): futebol.fetch_real(c)
-
-    def test_preview_real_por_rodada_data_e_today_offline(self):
-        c, source = self.real_source()
-        data = futebol.normalize_snapshot(c, source)
-        with tempfile.TemporaryDirectory() as directory, patch.object(futebol, 'NORMALIZED_DIR', Path(directory)):
-            c['_data_mode'] = 'real'
-            futebol.write_normalized(c, data)
-            for args in [('preview', '--source', 'real', '--current'), ('preview', '--source', 'real', '--date', '2026-07-16'), ('preview', '--source', 'real', '--today')]:
-                with self.subTest(args=args):
-                    code, output, error = self.run_cli(*args)
-                    self.assertEqual((code, error), (0, ''))
-                    self.assertTrue(output)
-
-    def test_real_nao_chama_rede_no_parser(self):
-        c, source = self.real_source()
-        with patch('urllib.request.urlopen') as network:
-            data = futebol.normalize_snapshot(c, source)
-        network.assert_not_called()
-        self.assertEqual(data['data_mode'], 'real')
-
-    def test_real_preview_mantem_campos_ausentes(self):
-        c, source = self.real_source(); data = futebol.normalize_snapshot(c, source)
-        data['matches'][0]['venue'] = ''; data['matches'][0]['city'] = ''; data['matches'][0]['state'] = ''
-        self.assertIn('Local: ainda não informado', futebol.render_preview(data, round_number=19))
-
-    def test_json_real_normaliza(self):
-        c = futebol.load_config()
-        payload = '{"jogos":[{"id":"x1","rodada":19,"mandante":"A","visitante":"B","data":"2026-07-16","horario":"19:30"}]}'
-        source = futebol.SourceSnapshot('CBF', futebol.REAL_URL_DEFAULT, 'real', futebol.now_iso(c['timezone']), payload, None, 'json')
-        self.assertEqual(len(futebol.normalize_snapshot(c, source)['matches']), 1)
-
-    def test_cli_normalize_funciona(self):
-        code, output, error = self.run_cli("normalize")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("JSON normalizado salvo em:", output)
-
-    def test_cli_preview_round_funciona(self):
-        code, output, error = self.run_cli("preview", "--round", "19")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("RODADA 19", output)
-
-    def test_cli_preview_current_funciona(self):
-        code, output, error = self.run_cli("preview", "--current")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("RODADA", output)
-
-    def test_cli_preview_date_funciona(self):
-        code, output, error = self.run_cli("preview", "--date", "2026-07-16")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("JOGOS DE 16/07/2026", output)
-
-    def test_cli_preview_today_funciona_com_relogio_controlado(self):
-        c, d = self.data()
-        with patch.object(futebol, "local_today", return_value=datetime.fromisoformat("2026-07-23T00:00:00-03:00").date()):
-            code, output, error = self.run_cli("preview", "--today")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("HOJE TEM FLAMENGO", output)
-
-    def test_cli_alerts_round_dry_run_funciona(self):
+    def test_doctor_and_real_commands_are_local(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch.object(futebol, "ALERT_LEDGER_PATH", root / "alerts.json"), patch.object(futebol, "ALERTS_PLAN_PATH", root / "plan.json"), patch.object(futebol, "ALERTS_PREVIEW_PATH", root / "preview.txt"):
-                code, output, error = self.run_cli("alerts", "--round", "19", "--dry-run")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("Alertas gerados: 2", output)
+            _, config_path, _ = self.real_config(directory)
+            output = io.StringIO()
+            with patch("orion_football.futebol.urlopen") as network, patch.object(futebol.sys, "version_info", (3, 11, 0)), patch.dict("sys.modules", {"pypdf": types.ModuleType("pypdf")}), redirect_stdout(output):
+                self.assertEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
+                self.assertEqual(futebol.main(["--config", str(config_path), "preview", "--source", "real", "--date", "2026-07-16"]), 0)
+                with patch("orion_football.futebol.local_today", return_value=futebol.parse_schedule_date("2026-07-16")):
+                    self.assertEqual(futebol.main(["--config", str(config_path), "preview", "--source", "real", "--today"]), 0)
+                self.assertEqual(futebol.main(["--config", str(config_path), "pregame", "--source", "real", "--date", "2026-07-23", "--minutes", "10"]), 0)
+            network.assert_not_called(); self.assertIn("JSON real legível", output.getvalue())
 
-    def test_cli_alerts_current_dry_run_funciona(self):
+    def test_doctor_errors_for_missing_config_json_and_invalid_json(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with patch.object(futebol, "ALERT_LEDGER_PATH", root / "alerts.json"), patch.object(futebol, "ALERTS_PLAN_PATH", root / "plan.json"), patch.object(futebol, "ALERTS_PREVIEW_PATH", root / "preview.txt"):
-                code, output, error = self.run_cli("alerts", "--current", "--dry-run")
-        self.assertEqual((code, error), (0, ""))
-        self.assertIn("Alertas gerados: 2", output)
+            missing = Path(directory) / "missing.json"
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(missing), "doctor"]), 0)
+            _, config_path, normalized = self.real_config(directory)
+            normalized.unlink()
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
+            normalized.parent.mkdir(parents=True, exist_ok=True); normalized.write_text("{invalid", encoding="utf-8")
+            with redirect_stdout(io.StringIO()): self.assertNotEqual(futebol.main(["--config", str(config_path), "doctor"]), 0)
 
-    def test_execucao_local_nao_chama_rede_nem_subprocesso(self):
-        with patch("urllib.request.urlopen") as urlopen, patch("subprocess.run") as run, patch("subprocess.Popen") as popen:
-            code, _, error = self.run_cli("preview", "--round", "19")
-        self.assertEqual((code, error), (0, ""))
-        urlopen.assert_not_called()
-        run.assert_not_called()
-        popen.assert_not_called()
+    def test_doctor_is_listed_in_help(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit) as exit_result: futebol.main(["--help"])
+        self.assertEqual(exit_result.exception.code, 0)
+        self.assertIn("doctor", output.getvalue())
 
-    def test_time_favorito_nao_fica_fixo_em_flamengo(self):
-        c, d = self.data()
-        c["owner_team"] = "Botafogo"
-        message = futebol.render_whatsapp_owner_team_message(c, d, 19)
-        self.assertIn("PRÓXIMO JOGO DO BOTAFOGO", message)
-        self.assertNotIn("PRÓXIMO JOGO DO FLAMENGO", message)
+    def fake_pdf_modules(self, texts):
+        pages = [types.SimpleNamespace(extract_text=lambda text=text: text) for text in texts]
+        module = types.ModuleType("pypdf")
+        module.PdfReader = lambda stream: types.SimpleNamespace(pages=pages)
+        return {"pypdf": module}
 
-    def test_fixture_textual_pdf_normaliza_campos(self):
-        c = futebol.load_config()
-        source = futebol.SourceSnapshot('CBF', 'fixture-text', 'fixture', futebol.now_iso(c['timezone']), futebol.TEXT_FIXTURE_PATH.read_text(), None, 'text')
-        data = futebol.normalize_snapshot(c, source)
-        self.assertEqual(len(data['matches']), 12)
-        self.assertEqual(data['matches'][0]['broadcasters'], ['Record', 'Youtube / Cazé TV', 'Premiere'])
-        self.assertEqual((data['matches'][0]['venue'], data['matches'][0]['city'], data['matches'][0]['state']), ('Nilton Santos', 'Rio de Janeiro', 'RJ'))
+    def candidate(self, config, *, changed=False):
+        data = futebol.normalize_snapshot(config, futebol.fetch_fixture(config))
+        data["data_mode"] = "real"
+        data["source"] = {"provider": "CBF", "fetched_at": "2026-07-20T12:00:00-03:00"}
+        if changed:
+            data["matches"][0]["venue"] = "Estádio Atualizado"
+        return data
 
-    def test_descoberta_pdf_e_fallback(self):
-        c = futebol.load_config()
-        html = '<a href="https://stcbfsiteprdimgbrs.blob.core.windows.net/x/Tabela_Detalhada_2026.pdf">PDF</a>'
-        self.assertTrue(futebol.discover_document_url(html, c).endswith('.pdf'))
-        self.assertEqual(futebol.locate_document_url(c, '<html>sem link</html>'), c['source']['document_url'])
+    def download(self):
+        body = b"%PDF-fake"
+        return futebol.PdfDownload("https://cbf.com.br/tabela.pdf", "https://cbf.com.br/tabela.pdf", 200, "application/pdf", body, hashlib.sha256(body).hexdigest(), futebol.REAL_URL_DEFAULT)
 
-    def test_host_nao_aprovado_rejeitado(self):
-        with self.assertRaises(futebol.FutebolError):
-            futebol.approved_url('https://example.com/tabela.pdf', document=True)
+    def test_extract_pdf_text_multiplas_paginas_e_pagina_vazia(self):
+        with patch.dict("sys.modules", self.fake_pdf_modules(["página um", None, "página três"])):
+            extracted = futebol.extract_pdf_text(b"%PDF-fake")
+        self.assertEqual(extracted.pages, ("página um", "", "página três"))
+        self.assertEqual(extracted.page_count, 3)
+        self.assertLess(extracted.text.index("página um"), extracted.text.index("página três"))
 
-    def test_comandos_invalidos_retornam_erro_claro(self):
-        for argv in (("preview", "--round"), ("preview", "--date", "16/07/2026"), ("alerts", "--round", "19")):
-            with self.subTest(argv=argv):
-                code, _, error = self.run_cli(*argv)
-                self.assertNotEqual(code, 0)
-                self.assertTrue(error.startswith("usage:") or "obrigatório" in error or "invalid" in error or "Data inválida" in error)
+    def test_extract_pdf_text_rejeita_sem_texto_e_pdf_invalido(self):
+        with patch.dict("sys.modules", self.fake_pdf_modules([None, "  "])):
+            with self.assertRaisesRegex(futebol.FutebolError, "camada textual"):
+                futebol.extract_pdf_text(b"%PDF-fake")
+        with self.assertRaisesRegex(futebol.FutebolError, "assinatura"):
+            futebol.extract_pdf_text("não é pdf".encode())
+
+    def test_download_pdf_rejeita_content_type_e_assinatura(self):
+        config = futebol.load_config()
+        headers = types.SimpleNamespace(get=lambda key, default='': 'text/plain', get_content_type=lambda: 'text/plain')
+        response = types.SimpleNamespace(headers=headers, geturl=lambda: futebol.REAL_DOCUMENT_DEFAULT)
+        with patch("orion_football.futebol._download", side_effect=[(b"<html>sem link</html>", response, 200), (b"%PDF-fake", response, 200)]):
+            with self.assertRaisesRegex(futebol.FutebolError, "Content-Type"):
+                futebol.download_pdf_from_article(config)
+        pdf_headers = types.SimpleNamespace(get=lambda key, default='': 'application/pdf', get_content_type=lambda: 'application/pdf')
+        pdf_response = types.SimpleNamespace(headers=pdf_headers, geturl=lambda: futebol.REAL_DOCUMENT_DEFAULT)
+        with patch("orion_football.futebol._download", side_effect=[(b"<html>sem link</html>", response, 200), (b"not-pdf", pdf_response, 200)]):
+            with self.assertRaisesRegex(futebol.FutebolError, "assinatura"):
+                futebol.download_pdf_from_article(config)
+
+    def test_download_pdf_usa_fallback_oficial_quando_artigo_falha(self):
+        config = futebol.load_config()
+        configured = config["source"]["document_url"]
+        pdf_headers = types.SimpleNamespace(get=lambda key, default='': 'application/pdf', get_content_type=lambda: 'application/pdf')
+        pdf_response = types.SimpleNamespace(headers=pdf_headers, geturl=lambda: configured)
+        with patch("orion_football.futebol._download", side_effect=[futebol.FutebolError("falha TLS"), (b"%PDF-fake", pdf_response, 200)]) as download:
+            result = futebol.download_pdf_from_article(config)
+        self.assertEqual(result.requested_url, configured)
+        self.assertEqual(download.call_args_list[1].args, (configured, config, "application/pdf"))
+
+    def test_download_pdf_rejeita_fallback_fora_dos_hosts_aprovados(self):
+        config = futebol.load_config()
+        config["source"]["document_url"] = "https://example.com/tabela.pdf"
+        with patch("orion_football.futebol._download", side_effect=futebol.FutebolError("offline")) as download:
+            with self.assertRaisesRegex(futebol.FutebolError, "infraestrutura oficial"):
+                futebol.download_pdf_from_article(config)
+        self.assertEqual(download.call_count, 1)
+
+    def test_normalize_real_entrega_texto_extraido_ao_parser(self):
+        config = futebol.load_config(); config["source"]["min_match_count"] = 1
+        extraction = futebol.PdfExtraction("linha um\nlinha dois", ("linha um", "linha dois"), 2)
+        match = self.candidate(config)["matches"][0]
+        with patch("orion_football.futebol.parse_pdf_line", side_effect=[match, None]) as parser:
+            data = futebol.normalize_pdf_real(config, extraction, self.download())
+        self.assertEqual(parser.call_args_list[0].args[0], "linha um")
+        self.assertEqual(len(data["matches"]), 1)
+
+    def test_refresh_updated_e_manifesto(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, active = self.real_config(directory)
+            before = active.read_bytes()
+            candidate = self.candidate(config, changed=True)
+            extraction = futebol.PdfExtraction("texto", ("texto",), 1)
+            with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()), patch("orion_football.futebol.extract_pdf_text", return_value=extraction), patch("orion_football.futebol.normalize_pdf_real", return_value=candidate):
+                result, path, manifest = futebol.refresh_real(config)
+            self.assertEqual(result, "UPDATED")
+            self.assertEqual(path, active)
+            self.assertNotEqual(active.read_bytes(), before)
+            self.assertEqual(manifest["result"], "UPDATED")
+            self.assertEqual((manifest["http_status"], manifest["page_count"], manifest["match_count"]), (200, 1, len(candidate["matches"])))
+            self.assertEqual(json.loads(futebol.manifest_path(config).read_text())["pdf_sha256"], self.download().pdf_sha256)
+
+    def test_refresh_unchanged_nao_regrava_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, active = self.real_config(directory)
+            previous = json.loads(active.read_text())
+            before = (active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
+            extraction = futebol.PdfExtraction("texto", ("texto",), 1)
+            with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()), patch("orion_football.futebol.extract_pdf_text", return_value=extraction), patch("orion_football.futebol.normalize_pdf_real", return_value=previous):
+                result, _, _ = futebol.refresh_real(config)
+            after = (active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
+            self.assertEqual(result, "UNCHANGED")
+            self.assertEqual(after, before)
+
+    def assert_refresh_preserved(self, failure_patch, expected):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, active = self.real_config(directory)
+            before = (active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
+            with failure_patch:
+                with self.assertRaisesRegex(futebol.FutebolError, "FAILED_PRESERVED") as raised:
+                    futebol.refresh_real(config)
+            after = (active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
+            self.assertEqual(after, before)
+            self.assertIn(expected, str(raised.exception))
+            manifest = json.loads(futebol.manifest_path(config).read_text())
+            self.assertEqual(manifest["result"], "FAILED_PRESERVED")
+
+    def test_falha_rede_preserva_snapshot(self):
+        self.assert_refresh_preserved(patch("orion_football.futebol.download_pdf_from_article", side_effect=futebol.FutebolError("Falha de rede")), "Falha de rede")
+
+    def test_falha_http_preserva_snapshot(self):
+        self.assert_refresh_preserved(patch("orion_football.futebol.download_pdf_from_article", side_effect=futebol.FutebolError("HTTP 503")), "HTTP 503")
+
+    def test_falha_extracao_preserva_snapshot(self):
+        with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()):
+            self.assert_refresh_preserved(patch("orion_football.futebol.extract_pdf_text", side_effect=futebol.FutebolError("extração falhou")), "extração falhou")
+
+    def test_falha_parser_preserva_snapshot(self):
+        extraction = futebol.PdfExtraction("texto", ("texto",), 1)
+        with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()), patch("orion_football.futebol.extract_pdf_text", return_value=extraction):
+            self.assert_refresh_preserved(patch("orion_football.futebol.normalize_pdf_real", side_effect=futebol.FutebolError("parser falhou")), "parser falhou")
+
+    def test_falha_schema_preserva_snapshot(self):
+        extraction = futebol.PdfExtraction("texto", ("texto",), 1)
+        with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()), patch("orion_football.futebol.extract_pdf_text", return_value=extraction):
+            self.assert_refresh_preserved(patch("orion_football.futebol.normalize_pdf_real", return_value={"schema_version": 999}), "schema_version")
+
+    def test_falha_escrita_preserva_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _, active = self.real_config(directory)
+            candidate = self.candidate(config, changed=True)
+            extraction = futebol.PdfExtraction("texto", ("texto",), 1)
+            original_write = futebol.write_json_atomic
+            def fail_active(path, data):
+                if path == active:
+                    raise OSError("disco indisponível")
+                return original_write(path, data)
+            before = hashlib.sha256(active.read_bytes()).hexdigest()
+            with patch("orion_football.futebol.download_pdf_from_article", return_value=self.download()), patch("orion_football.futebol.extract_pdf_text", return_value=extraction), patch("orion_football.futebol.normalize_pdf_real", return_value=candidate), patch("orion_football.futebol.write_json_atomic", side_effect=fail_active):
+                with self.assertRaisesRegex(futebol.FutebolError, "FAILED_PRESERVED"):
+                    futebol.refresh_real(config)
+            self.assertEqual(hashlib.sha256(active.read_bytes()).hexdigest(), before)
+
+    def test_sem_snapshot_anterior_falha_clara(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {"schema_version": 1, "competition": "campeonato_brasileiro_serie_a", "competition_display_name": "Brasileirão", "season": 2026, "owner_team": "Flamengo", "timezone": "America/Sao_Paulo", "data_dir": str(Path(directory) / "data"), "source": {"provider": "CBF", "mode": "real", "min_match_count": 1}}
+            with patch("orion_football.futebol.download_pdf_from_article", side_effect=futebol.FutebolError("offline")):
+                with self.assertRaisesRegex(futebol.FutebolError, "NO_PREVIOUS_DATA"):
+                    futebol.refresh_real(config)
+            self.assertFalse(futebol.normalized_path(config, "real").exists())
+            self.assertEqual(json.loads(futebol.manifest_path(config).read_text())["result"], "NO_PREVIOUS_DATA")
+
+    def test_candidato_rejeita_duplicada_incompleta_e_aceita_unscheduled(self):
+        config = futebol.load_config(); config["source"]["min_match_count"] = 1
+        valid = self.candidate(config)
+        unscheduled = copy.deepcopy(valid)
+        match = unscheduled["matches"][0]
+        match.update(status="unscheduled", kickoff=None, schedule_date=None, schedule_time=None, schedule_note="A definir pela CBF")
+        futebol.validate_real_candidate(config, unscheduled)
+        duplicate = copy.deepcopy(valid); duplicate["matches"].append(copy.deepcopy(duplicate["matches"][0]))
+        with self.assertRaisesRegex(futebol.FutebolError, "duplicadas"):
+            futebol.validate_real_candidate(config, duplicate)
+        incomplete = copy.deepcopy(valid); incomplete["matches"][0]["home_team"] = ""
+        with self.assertRaisesRegex(futebol.FutebolError, "Campo essencial"):
+            futebol.validate_real_candidate(config, incomplete)
+
+    def test_cli_normalize_real_publica_resultado(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, config_path, active = self.real_config(directory)
+            manifest = {"pdf_sha256": "a" * 64, "page_count": 2}
+            output = io.StringIO()
+            with patch("orion_football.futebol.refresh_real", return_value=("UNCHANGED", active, manifest)), redirect_stdout(output):
+                self.assertEqual(futebol.main(["--config", str(config_path), "normalize", "--source", "real"]), 0)
+            self.assertIn("RESULT: UNCHANGED", output.getvalue())
+
+    def test_preview_e_pregame_reais_apos_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, config_path, active = self.real_config(directory)
+            candidate = self.candidate(config, changed=True)
+            futebol.write_json_atomic(active, candidate)
+            with patch("orion_football.futebol.urlopen") as network, redirect_stdout(io.StringIO()):
+                self.assertEqual(futebol.main(["--config", str(config_path), "preview", "--source", "real", "--date", "2026-07-16"]), 0)
+                self.assertEqual(futebol.main(["--config", str(config_path), "pregame", "--source", "real", "--date", "2026-07-23", "--minutes", "10"]), 0)
+            network.assert_not_called()
 
 if __name__ == "__main__": unittest.main()

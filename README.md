@@ -1,63 +1,188 @@
 # Orion Football Alerts
 
-Projeto independente do Orion para ler uma tabela de futebol, normalizar partidas e gerar previews e alertas determinísticos. O runtime não usa LLM.
+CLI e biblioteca Python independentes para obter a tabela oficial da CBF, normalizar partidas e gerar previews e alertas locais de forma determinística. O runtime não usa modelos de linguagem e não inclui entrega por mensageria.
 
-## Funcionalidades atuais
+## O que o projeto faz
 
-- leitura offline da fixture e fonte real pelo PDF oficial da CBF;
-- normalização de partidas, rodada, horário, local e transmissão;
-- seleção de rodada e do time favorito;
-- preview textual;
-- fingerprint e idempotência genéricos em ledger local;
-- interface de entrega abstrata: WhatsApp não vem configurado.
+- localiza e baixa o PDF oficial divulgado pela CBF;
+- valida resposta HTTP, tipo de conteúdo, assinatura e tamanho do PDF;
+- extrai a camada textual com `pypdf` e normaliza partidas sem inferência probabilística;
+- destaca um time favorito configurável em previews diários;
+- gera alertas pré-jogo e planos de alerta locais;
+- mantém ledger e fingerprints para idempotência;
+- publica snapshots apenas depois de validação integral e escrita atômica.
 
-## Fonte CBF
+O projeto não agenda execuções, não envia mensagens, não escolhe destinatários e não inventa data, horário, estádio ou transmissão. Entrega por mensageria deve ser integrada externamente por quem usa a biblioteca ou a CLI.
 
-O modo `real` acessa o artigo oficial configurado, procura nele um PDF cujo nome corresponda ao padrão configurado e, se a descoberta falhar, usa a URL direta oficial de fallback. Apenas `cbf.com.br`, `www.cbf.com.br` e o blob oficial da CBF são aceitos. O PDF é validado por HTTP, Content-Type/assinatura `%PDF`, timeout, limite de bytes e SHA-256; depois o `pypdf` extrai o texto de todas as páginas e o parser determinístico valida as partidas.
+## Requisitos
 
-`fixture` continua sendo o padrão seguro, local e offline. A fixture textual `fixtures/cbf_tabela_detalhada_19_24_sample.txt` representa o formato do PDF; a fixture HTML legada permanece para compatibilidade dos testes existentes. O modo real baixa uma vez no `normalize` e grava JSON local; previews reais somente reutilizam esse JSON e não baixam novamente.
+- Python 3.11 ou superior;
+- acesso à internet somente para instalação de dependências e `normalize --source real`;
+- um PDF da CBF com camada textual extraível para atualização real.
 
-## Arquitetura
+O `doctor`, os previews sobre dados já normalizados e toda a fixture pública funcionam offline.
 
-O pacote `src/orion_football` contém a lógica determinística. `config` traz somente exemplo, `fixtures` contém dados sintéticos de teste e `tests` usa exclusivamente arquivos locais.
-
-## Requisitos e instalação
-
-Python 3.11+ é recomendado. A dependência de extração é `pypdf==6.12.1`.
+## Instalação
 
 ```bash
+git clone https://github.com/mortacci-tech/orion-football-alerts.git
+cd orion-football-alerts
 python3 -m venv .venv
 . .venv/bin/activate
-pip install .
+python -m pip install --upgrade pip
+python -m pip install .
 ```
 
-O pacote instala o comando `orion-football`. Para o passo a passo no macOS, consulte [docs/INSTALL-MACOS.md](docs/INSTALL-MACOS.md).
+O entrypoint instalado é `orion-football`. `requirements.txt` espelha apenas a dependência de runtime para fluxos que exigem esse formato; a instalação normal é `pip install .`.
+
+## Início rápido
+
+Crie uma configuração local a partir do exemplo seguro:
+
+```bash
+mkdir -p ~/.config/orion-football-alerts
+cp config/futebol_config.example.json ~/.config/orion-football-alerts/config.json
+orion-football doctor
+orion-football preview --source fixture --date 2026-07-16
+orion-football pregame --source fixture --date 2026-07-23
+```
+
+Também é possível indicar outro arquivo com `--config /caminho/config.json` ou com a variável `ORION_FOOTBALL_CONFIG`.
 
 ## Configuração
 
-Crie a configuração pessoal com `orion-football init --owner-team Flamengo --timezone America/Sao_Paulo --season 2026` e valide com `orion-football doctor`. O padrão é `~/Library/Application Support/Orion Football/config.json`; os dados ficam em `~/Library/Application Support/Orion Football/data/`. Não há token, telefone ou credencial necessária.
+O arquivo [config/futebol_config.example.json](config/futebol_config.example.json) documenta:
 
-## CLI local
+- `competition` e `competition_display_name`: identificador e nome exibido;
+- `season`: temporada consultada;
+- `owner_team`: time favorito destacado;
+- `timezone`: timezone IANA usado para datas e horários;
+- `pregame_minutes`: antecedência padrão do alerta pré-jogo;
+- `data_dir`: diretório local de snapshots, estado e manifesto;
+- `alerts`: tipos de alertas locais habilitados;
+- `source`: modo, URL do artigo oficial, URL oficial de fallback do PDF, timeout, limite de download e faixa plausível de partidas.
 
-`fixture` é o padrão seguro, offline e determinístico. `real` acessa somente a URL HTTPS oficial configurada da CBF, aplica timeout, limite de download, validação HTTP/conteúdo e registra URL, captura, formato, tamanho e SHA-256. A estrutura da CBF pode mudar; nesse caso a execução falha sem gerar tabela parcial.
+Os horários são preservados no timezone configurado. Campos ausentes na fonte continuam ausentes ou são marcados como não definidos; o programa não completa informações por conta própria.
+
+## Comandos
+
+Todos os comandos aceitam `--config` antes do subcomando.
+
+### `doctor`
+
+Valida offline o Python, imports, configuração e, no modo `real`, o snapshot local existente.
 
 ```bash
-orion-football --help
-orion-football normalize --source fixture
-orion-football preview --source fixture --round 19
-orion-football alerts --source fixture --round 19 --dry-run
-python3 -m orion_football.futebol preview --source fixture --round 19
-python3 -m unittest discover -s tests -p 'test_*.py'
+orion-football doctor
 ```
+
+### `fetch`
+
+Materializa a fixture pública no diretório de dados. O download real é deliberadamente concentrado em `normalize --source real` para que a validação e a publicação sejam uma única operação protegida.
+
+```bash
+orion-football fetch --source fixture
+```
+
+### `normalize`
+
+Normaliza a fixture ou atualiza os dados a partir da fonte oficial.
+
+```bash
+orion-football normalize --source fixture
+orion-football normalize --source real
+```
+
+Uma atualização real termina em um destes estados:
+
+- `UPDATED`: conteúdo esportivo mudou e o snapshot foi substituído;
+- `UNCHANGED`: conteúdo idêntico; o arquivo ativo não é regravado;
+- `FAILED_PRESERVED`: falha com snapshot anterior preservado;
+- `NO_PREVIOUS_DATA`: falha sem snapshot válido anterior.
+
+Não há retry automático. Em caso de falha, nenhuma tabela parcial é publicada.
+
+### `preview`
+
+Gera resumo por rodada, rodada atual, data ou dia local atual. O time definido em `owner_team` recebe destaque quando joga.
+
+```bash
+orion-football preview --source fixture --round 19
+orion-football preview --source fixture --date 2026-07-16
+orion-football preview --source fixture --today
+orion-football preview --source real --current
+```
+
+### `pregame`
+
+Gera texto local para o jogo do time favorito na data indicada. `--minutes` sobrescreve `pregame_minutes`.
+
+```bash
+orion-football pregame --source fixture --date 2026-07-23
+orion-football pregame --source fixture --date 2026-07-23 --minutes 10
+```
+
+### `run`
+
+Executa normalização e preview local. O modo dry-run é obrigatório.
+
+```bash
+orion-football run --source fixture --dry-run
+orion-football run --source real --dry-run
+```
+
+### `alerts`
+
+Gera plano, preview e ledger locais a partir de um snapshot já normalizado. O ledger usa chave lógica e fingerprint de conteúdo para tornar repetições observáveis e idempotentes.
+
+```bash
+orion-football normalize --source fixture
+orion-football alerts --source fixture --round 19 --dry-run
+orion-football alerts --source fixture --current --dry-run
+```
+
+## Fonte oficial e atualização segura
+
+A fonte primária é a Confederação Brasileira de Futebol (CBF). No modo real, o programa acessa apenas hosts CBF aprovados, localiza o PDF no artigo oficial e, se a descoberta falhar, tenta uma única URL oficial de fallback configurada. Depois valida o download e extrai todas as páginas com `pypdf`. O candidato completo passa por validações de schema, duplicidade, campos essenciais e quantidade plausível antes da publicação.
+
+A comparação usa SHA-256 canônico sem metadados voláteis. A escrita do snapshot e do manifesto usa arquivo temporário no mesmo filesystem, `flush`, `fsync` e `os.replace`. O manifesto `brasileirao_serie_a_<ano>_real_source_manifest.json` registra URLs, HTTP, tipo de conteúdo, tamanho, hashes, páginas, quantidade de partidas, resultado e erro resumido.
+
+## Arquitetura
+
+- `src/orion_football/`: pacote, CLI e recursos públicos instaláveis;
+- `config/`: configuração de exemplo;
+- `fixtures/`: amostra pública usada em testes offline;
+- `tests/`: suíte `unittest` determinística;
+- `docs/ARCHITECTURE.md`: fluxo de dados e limites do runtime.
+
+O pacote é independente: configuração, dados, estado e ledger ficam no diretório escolhido pelo usuário. Veja [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) para o fluxo resumido.
+
+## Testes
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+python -m compileall -q src tests
+python -m build
+```
+
+A CI executa instalação normal, testes, compilação e build nas versões de Python suportadas, sem downloads da CBF e sem serviços externos.
 
 ## Limitações
 
-Não há WhatsApp, OpenClaw, agendamento, retry automático, LaunchAgent ou instalador automático. Alertas permanecem exclusivamente em dry-run. O produto ainda não está pronto para o público. Campos ausentes aparecem vazios ou como “ainda não informado”; não são inventados.
+- A extração requer camada textual no PDF.
+- Mudanças futuras no formato da CBF podem exigir atualização do parser.
+- A fixture cobre cenários de teste e não representa uma temporada completa.
+- O projeto gera conteúdo e estado locais; agendamento e entrega são responsabilidades de integrações externas.
+- Os nomes e direitos sobre competições, clubes e fontes pertencem aos respectivos titulares.
 
-## Segurança e privacidade
+Quando o formato da fonte muda, a falha é fechada: o candidato inválido não substitui o último snapshot válido.
 
-Nenhuma credencial, token, telefone, ledger operacional, estado, log ou documento interno é distribuído. Não há destino de WhatsApp configurado.
+## Privacidade e segurança
 
-## Roadmap
+O repositório não distribui credenciais, contatos, destinatários, dados pessoais, documentos baixados, logs, estado ou ledgers de produção. Configurações locais, manifestos de runtime, PDFs e JSONs reais são ignorados pelo Git. Consulte [SECURITY.md](SECURITY.md) para relatar uma vulnerabilidade.
 
-1. acompanhar mudanças no formato oficial da CBF; 2. manter fixtures e validações offline; 3. definir posteriormente uma entrega, em missão separada.
+## Licença, contribuição e suporte
+
+Distribuído sob a [licença MIT](LICENSE). A versão atual é `0.1.0`, uma versão inicial alpha; consulte [CHANGELOG.md](CHANGELOG.md).
+
+Contribuições devem preservar determinismo, privacidade e testes offline. Leia [CONTRIBUTING.md](CONTRIBUTING.md). Para suporte, bugs ou propostas, abra uma [issue no GitHub](https://github.com/mortacci-tech/orion-football-alerts/issues).
