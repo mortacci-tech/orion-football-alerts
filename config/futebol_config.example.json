@@ -8,6 +8,13 @@
   "data_dir": "~/Library/Application Support/Orion Football/data",
   "source": {
     "provider": "CBF",
-    "mode": "fixture"
+    "mode": "fixture",
+    "article_url": "https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a",
+    "document_name_pattern": "Tabela_Detalhada.*\\.pdf",
+    "timeout_seconds": 20,
+    "max_download_bytes": 5000000,
+    "min_match_count": 10,
+    "max_match_count": 1000,
+    "user_agent": "orion-football-alerts/0.1 (official CBF source reader)"
   }
 }

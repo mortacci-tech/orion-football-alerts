@@ -7,6 +7,7 @@ name = "orion-football-alerts"
 version = "0.1.0"
 description = "Alertas determinísticos de futebol"
 requires-python = ">=3.11"
+dependencies = ["pypdf==6.12.1"]
 
 [project.scripts]
 orion-football = "orion_football.futebol:main"

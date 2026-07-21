@@ -2,22 +2,26 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR.parent.parent / 'config' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR.parent.parent / 'fixtures' / 'cbf_tabela_detalhada_sample.html'
+REAL_URL_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a'
+REAL_DOCUMENT_DEFAULT = 'https://stcbfsiteprdimgbrs.blob.core.windows.net/img-site/cdn/Tabela_Detalhada_Brasileiro_Serie_A_2026_19_a_24_rodada_82505dee72.pdf'
 DEFAULT_CONFIG_PATH = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'config.json'
 DEFAULT_DATA_DIR = Path.home() / 'Library' / 'Application Support' / 'Orion Football' / 'data'
 BROADCASTERS_BY_COLUMN = {'1': 'Globo', '2': 'Record', '3': 'Sportv', '4': 'Amazon', '5': 'Youtube / Cazé TV', '6': 'GE TV', '7': 'Premiere'}
@@ -35,6 +39,22 @@ class SourceSnapshot:
     fetched_at: str
     html_text: str
     raw_path: Path | None
+
+@dataclass(frozen=True)
+class PdfDownload:
+    requested_url: str
+    final_url: str
+    http_status: int
+    content_type: str
+    body: bytes
+    pdf_sha256: str
+    article_url: str
+
+@dataclass(frozen=True)
+class PdfExtraction:
+    text: str
+    pages: tuple[str, ...]
+    page_count: int
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path:
     if explicit:
@@ -113,6 +133,105 @@ def fetch_fixture(config: dict[str, Any]) -> SourceSnapshot:
         raise FutebolError(f'Fixture não encontrada: {FIXTURE_PATH}')
     tz_name = config['timezone']
     return SourceSnapshot(provider='CBF', url=str(FIXTURE_PATH), status='fixture', fetched_at=now_iso(tz_name), html_text=FIXTURE_PATH.read_text(encoding='utf-8'), raw_path=None)
+
+ALLOWED_CBF_HOSTS = {'cbf.com.br', 'www.cbf.com.br', 'stcbfsiteprdimgbrs.blob.core.windows.net'}
+
+def source_config(config: dict[str, Any]) -> dict[str, Any]:
+    return config.get('source', {})
+
+def approved_url(value: str, *, document: bool = False) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != 'https' or parsed.hostname not in ALLOWED_CBF_HOSTS:
+        raise FutebolError(f'URL não pertence à infraestrutura oficial aprovada da CBF: {value}')
+    if document and not parsed.path.lower().endswith('.pdf'):
+        raise FutebolError(f'URL de documento CBF não é PDF: {value}')
+    return value
+
+def _download(url: str, config: dict[str, Any], accept: str) -> tuple[bytes, Any, int]:
+    settings = source_config(config)
+    max_bytes = int(settings.get('max_download_bytes', 5_000_000))
+    request = Request(approved_url(url), headers={
+        'User-Agent': settings.get('user_agent', 'orion-football-alerts/0.1'),
+        'Accept': accept,
+    })
+    try:
+        with urlopen(request, timeout=float(settings.get('timeout_seconds', 20))) as response:
+            status = int(getattr(response, 'status', None) or response.getcode())
+            if not 200 <= status < 300:
+                raise FutebolError(f'Fonte CBF respondeu HTTP {status}.')
+            content_main = response.headers.get_content_type().lower()
+            if accept == 'text/html' and content_main not in {'text/html', 'application/xhtml+xml'}:
+                raise FutebolError(f'Tipo de conteúdo inesperado no artigo CBF: {content_main}.')
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(min(65_536, max_bytes - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FutebolError(f'Download da CBF excede o limite de {max_bytes} bytes.')
+                chunks.append(chunk)
+            return b''.join(chunks), response, status
+    except HTTPError as exc:
+        raise FutebolError(f'Fonte CBF respondeu HTTP {exc.code}.') from exc
+    except (TimeoutError, URLError, OSError) as exc:
+        reason = getattr(exc, 'reason', exc)
+        raise FutebolError(f'Falha ao acessar a fonte CBF: {reason}.') from exc
+
+def discover_document_url(article_html: str, config: dict[str, Any], base_url: str = REAL_URL_DEFAULT) -> str:
+    pattern = source_config(config).get('document_name_pattern', r'Tabela_Detalhada.*\.pdf')
+    candidates = re.findall(r'(?:href|src)=["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']', article_html, flags=re.I)
+    candidates += re.findall(r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?', article_html, flags=re.I)
+    for raw in candidates:
+        candidate = urljoin(base_url, html.unescape(raw))
+        if re.search(pattern, candidate, flags=re.I):
+            return approved_url(candidate, document=True)
+    raise FutebolError('Artigo oficial não contém link PDF de tabela detalhada aprovado.')
+
+def download_pdf_from_article(config: dict[str, Any]) -> PdfDownload:
+    settings = source_config(config)
+    article_url = approved_url(settings.get('article_url') or REAL_URL_DEFAULT)
+    try:
+        article_body, _, _ = _download(article_url, config, 'text/html')
+        document_url = discover_document_url(article_body.decode('utf-8', errors='replace'), config, article_url)
+    except FutebolError:
+        document_url = approved_url(settings.get('document_url') or REAL_DOCUMENT_DEFAULT, document=True)
+    body, response, status = _download(document_url, config, 'application/pdf')
+    content_type = response.headers.get('Content-Type', '')
+    content_main = response.headers.get_content_type().lower()
+    if not body:
+        raise FutebolError('Resposta vazia: PDF da CBF vazio.')
+    if content_main != 'application/pdf':
+        raise FutebolError(f'Resposta da CBF não é PDF (Content-Type: {content_type or "ausente"}).')
+    if not body.startswith(b'%PDF'):
+        raise FutebolError('Resposta declarada como PDF, mas não possui assinatura %PDF.')
+    final_url = response.geturl() if hasattr(response, 'geturl') else document_url
+    approved_url(final_url, document=True)
+    return PdfDownload(document_url, final_url, status, content_type, body, hashlib.sha256(body).hexdigest(), article_url)
+
+def extract_pdf_text(pdf: bytes | bytearray | Path | str) -> PdfExtraction:
+    if isinstance(pdf, (str, Path)):
+        path = Path(pdf).expanduser()
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise FutebolError(f'Não foi possível ler o PDF: {path}: {exc}') from exc
+    elif isinstance(pdf, (bytes, bytearray)):
+        body = bytes(pdf)
+    else:
+        raise FutebolError('PDF deve ser informado como bytes ou caminho explícito.')
+    if not body.startswith(b'%PDF'):
+        raise FutebolError('PDF inválido: assinatura %PDF ausente.')
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(body))
+        pages = tuple((page.extract_text() or '') for page in reader.pages)
+    except Exception as exc:
+        raise FutebolError(f'PDF da CBF corrompido ou ilegível: {exc}') from exc
+    if not pages or not any(page.strip() for page in pages):
+        raise FutebolError('PDF da CBF não possui camada textual utilizável.')
+    return PdfExtraction('\n'.join(pages), pages, len(pages))
 
 def clean_text(value: str) -> str:
     value = html.unescape(re.sub('<[^>]+>', ' ', value))
@@ -196,6 +315,66 @@ def parse_broadcasters(raw: str) -> list[str]:
     parts = re.split('\\s*/\\s*|,\\s*|;\\s*', raw)
     return [part.strip() for part in parts if part.strip()]
 
+CITY_NAMES = ('Bragança Paulista', 'Belo Horizonte', 'Rio de Janeiro', 'São Paulo', 'Porto Alegre', 'Chapecó', 'Curitiba', 'Salvador', 'Mirassol', 'Santos', 'Belém')
+STATE_CODES = r'AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO'
+
+def _pdf_location_and_broadcast(rest: str) -> tuple[str, str, str, list[str]]:
+    broadcast_numbers = re.findall(r'(?<!\d)[1-7](?!\d)', rest)
+    rest = re.sub(r'\s+[1-7](?:\s+[1-7])*$', '', rest).strip()
+    state_match = re.search(rf'\s+({STATE_CODES})$', rest)
+    state = state_match.group(1) if state_match else ''
+    before = rest[:state_match.start()].strip() if state_match else ''
+    city = next((name for name in sorted(CITY_NAMES, key=len, reverse=True) if before.endswith(name)), '')
+    venue = before[:-len(city)].strip() if city else ''
+    return venue, city, state, [BROADCASTERS_BY_COLUMN[number] for number in broadcast_numbers]
+
+def parse_pdf_line(line: str, config: dict[str, Any], current_round: int | None = None) -> dict[str, Any] | None:
+    line = re.sub(r'^A definir(?=\d)', '', line, flags=re.I).strip()
+    pending = re.match(rf'^(\d+)\s+(\d+)[ªaº]?\s+A\s+(?:def\.?|definir)\.?\s+(.+?)\s+({STATE_CODES})\s+x\s+(.+?)\s+({STATE_CODES})\s+(.*)$', line, flags=re.I)
+    if pending:
+        reference, round_text, home, _home_uf, away, _away_uf, rest = pending.groups()
+        venue, city, state, broadcasters = _pdf_location_and_broadcast(rest)
+        return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': int(round_text), 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': None, 'schedule_date': None, 'schedule_time': None, 'schedule_note': 'Data e horário a definir pela CBF', 'venue': venue, 'city': city, 'state': state, 'broadcasters': broadcasters, 'status': 'unscheduled'}
+    pattern = rf'^(\d+)\s+(?:(\d+)[ªaº]?\s+)?(\d{{2}}/\d{{2}})\s+\S+\s+(?:(\d{{1,2}}:\d{{2}})\s+)?(.+?)\s+({STATE_CODES})\s+x\s+(.+?)\s+({STATE_CODES})\s+(.*)$'
+    match = re.match(pattern, line, flags=re.I)
+    if not match:
+        return None
+    reference, round_text, date_text, time_text, home, _home_uf, away, _away_uf, rest = match.groups()
+    round_number = int(round_text) if round_text else current_round
+    if round_number is None:
+        return None
+    if not time_text:
+        return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': round_number, 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': None, 'schedule_date': None, 'schedule_time': None, 'schedule_note': 'Data e horário a definir pela CBF', 'venue': '', 'city': '', 'state': '', 'broadcasters': [], 'status': 'unscheduled'}
+    day, month = map(int, date_text.split('/'))
+    hour, minute = map(int, time_text.split(':'))
+    kickoff = datetime(int(config['season']), month, day, hour, minute, tzinfo=ZoneInfo(config['timezone']))
+    venue, city, state, broadcasters = _pdf_location_and_broadcast(rest)
+    return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': round_number, 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': kickoff.isoformat(timespec='seconds'), 'schedule_date': kickoff.date().isoformat(), 'schedule_time': f'{hour:02d}:{minute:02d}', 'schedule_note': None, 'venue': venue, 'city': city, 'state': state, 'broadcasters': broadcasters, 'status': 'scheduled'}
+
+def normalize_pdf_real(config: dict[str, Any], extraction: PdfExtraction, download: PdfDownload | None = None) -> dict[str, Any]:
+    matches: list[dict[str, Any]] = []
+    current_round: int | None = None
+    for line in extraction.text.splitlines():
+        parsed = parse_pdf_line(line, config, current_round)
+        if parsed:
+            current_round = int(parsed['round'])
+            matches.append(parsed)
+    if not matches:
+        raise FutebolError('Nenhuma partida encontrada no texto extraído do PDF da CBF.')
+    matches.sort(key=match_sort_key)
+    source = {
+        'provider': 'CBF',
+        'url': download.requested_url if download else '',
+        'final_url': download.final_url if download else '',
+        'status': 'real',
+        'fetched_at': now_iso(config['timezone']),
+        'document_sha256': download.pdf_sha256 if download else '',
+        'content_length': len(download.body) if download else 0,
+        'content_type': download.content_type if download else '',
+        'page_count': extraction.page_count,
+    }
+    return {'schema_version': 1, 'data_mode': 'real', 'competition': config['competition'], 'competition_display_name': config.get('competition_display_name', ''), 'season': int(config['season']), 'timezone': config['timezone'], 'source': source, 'matches': matches}
+
 def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[str, Any]:
     matches = [parse_match(row, config, source) for row in extract_rows(source.html_text)]
     seen: set[str] = set()
@@ -213,16 +392,29 @@ def normalize_snapshot(config: dict[str, Any], source: SourceSnapshot) -> dict[s
 def build_summary(matches: list[dict[str, Any]]) -> dict[str, int]:
     return {'total_matches': len(matches), 'scheduled_matches': sum((1 for match in matches if match.get('status') == 'scheduled')), 'unscheduled_matches': sum((1 for match in matches if match.get('status') == 'unscheduled'))}
 
-def validate_matches(matches: list[dict[str, Any]]) -> None:
+def validate_matches(matches: list[dict[str, Any]], *, min_count: int = 1, max_count: int = 1_000) -> None:
     if not matches:
         raise FutebolError('Normalização não gerou partidas.')
-    ids = [match['match_id'] for match in matches]
+    if not min_count <= len(matches) <= max_count:
+        raise FutebolError(f'Quantidade anormal de partidas: {len(matches)}; esperado entre {min_count} e {max_count}.')
+    ids = [match.get('match_id') for match in matches]
+    if any(not isinstance(match_id, str) or not match_id.strip() for match_id in ids):
+        raise FutebolError('Partida sem match_id válido.')
     if len(ids) != len(set(ids)):
         raise FutebolError('Partidas duplicadas detectadas por match_id.')
     for match in matches:
         for field in ['round', 'home_team', 'away_team', 'status']:
             if match.get(field) in (None, ''):
                 raise FutebolError(f'Campo essencial ausente após normalização: {field}')
+        try:
+            if int(match['round']) <= 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise FutebolError(f"Rodada inválida: {match.get('round')}") from exc
+        if not str(match['home_team']).strip() or not str(match['away_team']).strip():
+            raise FutebolError('Mandante e visitante devem estar preenchidos.')
+        if match['home_team'].casefold() == match['away_team'].casefold():
+            raise FutebolError('Mandante e visitante não podem ser iguais.')
         if match['status'] == 'scheduled':
             if not match.get('kickoff'):
                 raise FutebolError('Partida scheduled sem kickoff.')
@@ -231,6 +423,10 @@ def validate_matches(matches: list[dict[str, Any]]) -> None:
                 raise FutebolError(f"Data sem timezone: {match['kickoff']}")
             if not match.get('schedule_date') or not match.get('schedule_time'):
                 raise FutebolError('Partida scheduled sem schedule_date/schedule_time.')
+            if date.fromisoformat(match['schedule_date']) != parsed.date():
+                raise FutebolError('schedule_date incoerente com kickoff.')
+            if not re.fullmatch(r'\d{2}:\d{2}', str(match['schedule_time'])):
+                raise FutebolError('schedule_time inválido.')
         elif match['status'] == 'unscheduled':
             if match.get('kickoff') is not None:
                 raise FutebolError('Partida unscheduled não pode possuir kickoff.')
@@ -247,6 +443,128 @@ def write_normalized(config: dict[str, Any], data: dict[str, Any], source: str='
     path = normalized_path(config, source)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return path
+
+def manifest_path(config: dict[str, Any]) -> Path:
+    return data_dir(config) / 'state' / f'brasileirao_serie_a_{config["season"]}_real_source_manifest.json'
+
+def canonical_sports_json(data: dict[str, Any]) -> bytes:
+    payload = {
+        'schema_version': data.get('schema_version'),
+        'data_mode': data.get('data_mode'),
+        'competition': data.get('competition'),
+        'competition_display_name': data.get('competition_display_name', ''),
+        'season': data.get('season'),
+        'timezone': data.get('timezone'),
+        'matches': data.get('matches'),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+def canonical_sha256(data: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_sports_json(data)).hexdigest()
+
+def validate_real_candidate(config: dict[str, Any], data: dict[str, Any]) -> None:
+    if data.get('schema_version') != 1:
+        raise FutebolError('Candidato real possui schema_version inválido.')
+    if data.get('data_mode') != 'real':
+        raise FutebolError('Candidato real possui data_mode inválido.')
+    if data.get('competition') != config.get('competition'):
+        raise FutebolError('Competition do candidato diverge da configuração.')
+    if int(data.get('season', 0)) != int(config.get('season', 0)):
+        raise FutebolError('Season do candidato diverge da configuração.')
+    if not isinstance(data.get('matches'), list):
+        raise FutebolError('Candidato real não possui lista de partidas.')
+    settings = source_config(config)
+    validate_matches(data['matches'], min_count=int(settings.get('min_match_count', 10)), max_count=int(settings.get('max_match_count', 1_000)))
+
+def read_valid_previous(config: dict[str, Any], path: Path) -> tuple[dict[str, Any] | None, str]:
+    if not path.exists():
+        return None, ''
+    try:
+        previous = json.loads(path.read_text(encoding='utf-8'))
+        validate_real_candidate(config, previous)
+    except (OSError, json.JSONDecodeError, FutebolError) as exc:
+        raise FutebolError(f'JSON real anterior existe, mas não é válido: {path}: {exc}') from exc
+    return previous, canonical_sha256(previous)
+
+def write_bytes_atomic(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp', delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    write_bytes_atomic(path, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
+
+def _manifest(config: dict[str, Any], *, result: str, active_path: Path, previous_sha: str = '', candidate_sha: str = '', download: PdfDownload | None = None, page_count: int = 0, match_count: int = 0, error: str = '') -> dict[str, Any]:
+    return {
+        'schema_version': 1,
+        'timestamp': now_iso(config['timezone']),
+        'requested_url': download.requested_url if download else source_config(config).get('article_url', REAL_URL_DEFAULT),
+        'final_url': download.final_url if download else '',
+        'http_status': download.http_status if download else None,
+        'content_type': download.content_type if download else '',
+        'size_bytes': len(download.body) if download else 0,
+        'pdf_sha256': download.pdf_sha256 if download else '',
+        'page_count': page_count,
+        'match_count': match_count,
+        'candidate_json_sha256': candidate_sha,
+        'previous_json_sha256': previous_sha,
+        'result': result,
+        'error': re.sub(r'\s+', ' ', error).strip()[:500],
+        'active_json_path': str(active_path),
+    }
+
+def refresh_real(config: dict[str, Any]) -> tuple[str, Path, dict[str, Any]]:
+    active_path = normalized_path(config, 'real')
+    previous: dict[str, Any] | None = None
+    previous_sha = ''
+    download: PdfDownload | None = None
+    extraction: PdfExtraction | None = None
+    candidate: dict[str, Any] | None = None
+    candidate_sha = ''
+    try:
+        previous, previous_sha = read_valid_previous(config, active_path)
+        download = download_pdf_from_article(config)
+        extraction = extract_pdf_text(download.body)
+        candidate = normalize_pdf_real(config, extraction, download)
+        validate_real_candidate(config, candidate)
+        candidate_sha = canonical_sha256(candidate)
+        result = 'UNCHANGED' if previous_sha and previous_sha == candidate_sha else 'UPDATED'
+        raw_pdf_path = raw_path(config, f'cbf_{config["season"]}_real.pdf')
+        write_bytes_atomic(raw_pdf_path, download.body)
+        manifest = _manifest(config, result=result, active_path=active_path, previous_sha=previous_sha, candidate_sha=candidate_sha, download=download, page_count=extraction.page_count, match_count=len(candidate['matches']))
+        write_json_atomic(manifest_path(config), manifest)
+        if result == 'UPDATED':
+            write_json_atomic(active_path, candidate)
+        return result, active_path, manifest
+    except Exception as exc:
+        error = exc if isinstance(exc, FutebolError) else FutebolError(f'Falha na atualização real: {exc}')
+        result = 'FAILED_PRESERVED' if previous is not None else 'NO_PREVIOUS_DATA'
+        candidate_matches = candidate.get('matches') if isinstance(candidate, dict) else None
+        manifest = _manifest(config, result=result, active_path=active_path, previous_sha=previous_sha, candidate_sha=candidate_sha, download=download, page_count=extraction.page_count if extraction else 0, match_count=len(candidate_matches) if isinstance(candidate_matches, list) else 0, error=str(error))
+        try:
+            write_json_atomic(manifest_path(config), manifest)
+        except Exception as manifest_exc:
+            raise FutebolError(f'{result}: {error}; falha ao registrar manifesto: {manifest_exc}') from exc
+        preservation = 'snapshot anterior preservado' if previous is not None else 'não existe snapshot anterior válido'
+        raise FutebolError(f'{result}: {error}; {preservation}.') from exc
 
 def write_fixture_raw(config: dict[str, Any], snapshot: SourceSnapshot) -> Path:
     ensure_dirs(config)
@@ -532,17 +850,8 @@ def load_alert_ledger(path: Path) -> dict[str, Any]:
         raise FutebolError(f'Ledger de alertas inválido: {path}')
     return ledger
 
-def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + '.tmp')
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    os.replace(tmp_path, path)
-
 def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + '.tmp')
-    tmp_path.write_text(text, encoding='utf-8')
-    os.replace(tmp_path, path)
+    write_bytes_atomic(path, text.encode('utf-8'))
 
 def update_alert_ledger(alerts: list[dict[str, Any]], observed_at: str, path: Path) -> tuple[dict[str, Any], int, int]:
     ledger = load_alert_ledger(path)
@@ -607,9 +916,12 @@ def cmd_normalize(args: argparse.Namespace) -> int:
         data = normalize_snapshot(config, snapshot)
         path = write_normalized(config, data, 'fixture')
     else:
-        pdf_source = extract_pdf_text(download_pdf_from_article(config))
-        data = normalize_pdf_real(config, pdf_source)
-        path = write_normalized(config, data, 'real')
+        result, path, manifest = refresh_real(config)
+        data = load_normalized(config, 'real')
+        print(f'RESULT: {result}')
+        print(f'Manifesto: {manifest_path(config)}')
+        print(f'PDF SHA-256: {manifest["pdf_sha256"]}')
+        print(f'Páginas: {manifest["page_count"]}')
     print(f'JSON normalizado salvo em: {path}')
     print(f"Partidas normalizadas: {len(data['matches'])}")
     return 0
@@ -655,9 +967,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         data = normalize_snapshot(config, snapshot)
         path = write_normalized(config, data, 'fixture')
     else:
-        pdf_source = extract_pdf_text(download_pdf_from_article(config))
-        data = normalize_pdf_real(config, pdf_source)
-        path = write_normalized(config, data, 'real')
+        result, path, _ = refresh_real(config)
+        data = load_normalized(config, 'real')
+        print(f'RESULT: {result}')
     print(f'DRY-RUN local concluído. JSON: {path}')
     print('')
     print(render_preview(data, current=True))

@@ -4,7 +4,7 @@ Projeto independente do Orion para ler uma tabela de futebol, normalizar partida
 
 ## Funcionalidades atuais
 
-- leitura de fixture HTML local;
+- leitura de fixture HTML local e atualização pelo PDF oficial da CBF;
 - normalização de partidas, rodada, horário, local e transmissão;
 - seleção de rodada e do time favorito;
 - preview textual;
@@ -35,6 +35,41 @@ O comando instalado é `orion-football`. Por padrão ele lê
 `data_dir/normalized/`. `orion-football doctor` é estritamente offline: valida
 a configuração e, no modo `real`, apenas lê o JSON local já normalizado.
 
+## Atualização real protegida
+
+`orion-football normalize --source real` baixa o artigo oficial uma vez, localiza
+o PDF configurado, valida HTTP, tipo de conteúdo, assinatura e tamanho, extrai
+todas as páginas com `pypdf` e executa o parser determinístico. O candidato é
+validado integralmente antes de qualquer publicação. A troca usa arquivo
+temporário no mesmo filesystem, `flush`, `fsync` e `os.replace`.
+
+O conteúdo esportivo é comparado por SHA-256 canônico, sem metadados voláteis:
+
+- `UPDATED`: houve mudança e o snapshot foi substituído atomicamente;
+- `UNCHANGED`: não houve mudança e o JSON ativo, inclusive seu `mtime`, não é regravado;
+- `FAILED_PRESERVED`: houve falha e o último snapshot válido permanece intacto;
+- `NO_PREVIOUS_DATA`: houve falha e não existia snapshot válido anterior.
+
+Falhas preservadas e ausência de dados retornam erro operacional; não são
+mascaradas como sucesso. O manifesto fica em
+`data_dir/state/brasileirao_serie_a_<ano>_real_source_manifest.json` e registra
+URLs, HTTP, Content-Type, tamanho, SHA-256 do PDF e dos JSONs canônicos, páginas,
+partidas, resultado, erro resumido e caminho ativo. Nenhum telefone ou segredo é
+registrado.
+
+Comando manual:
+
+```bash
+orion-football normalize --source real
+orion-football doctor
+```
+
+Sem rede, o refresh falha de forma observável e preserva o snapshot anterior.
+Se o formato da CBF mudar, examine o manifesto, congele uma amostra sem dados
+sensíveis, ajuste o parser e valide offline antes de tentar novamente. Não há
+garantia de compatibilidade automática com formatos futuros; a garantia é falha
+fechada, snapshot anterior preservado e nenhuma tabela parcial publicada.
+
 ## Comandos usando fixture
 
 ```bash
@@ -51,7 +86,10 @@ comandos são locais, determinísticos e não enviam mensagens.
 
 ## Limitações
 
-Não há download automático, sender real, agendamento, retry ou integração com o Orion. Fontes externas podem mudar; o usuário deve respeitar os termos de uso da fonte.
+Não há sender real, retry automático ou integração de runtime com o Orion. A
+extração depende de camada textual no PDF e o parser pode precisar de adaptação
+quando a CBF mudar o documento. Fontes externas podem mudar; o usuário deve
+respeitar os termos de uso da fonte.
 
 ## Segurança e privacidade
 
