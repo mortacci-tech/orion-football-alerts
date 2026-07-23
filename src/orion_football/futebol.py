@@ -21,6 +21,7 @@ CONFIG_PATH = BASE_DIR / 'resources' / 'futebol_config.example.json'
 FIXTURE_PATH = BASE_DIR / 'resources' / 'cbf_tabela_detalhada_sample.html'
 REAL_URL_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/noticias/campeonato-brasileiro/campeonato-brasileiro-serie-a/cbf-divulga-tabela-detalhada-das-rodadas-19-a-24-do-brasileirao-serie-a'
 REAL_DOCUMENT_DEFAULT = 'https://stcbfsiteprdimgbrs.blob.core.windows.net/img-site/cdn/Tabela_Detalhada_Brasileiro_Serie_A_2026_19_a_24_rodada_82505dee72.pdf'
+REAL_TABLE_DEFAULT = 'https://www.cbf.com.br/futebol-brasileiro/tabelas/campeonato-brasileiro/serie-a/2026'
 DEFAULT_CONFIG_PATH = Path.home() / '.config' / 'orion-football-alerts' / 'config.json'
 DEFAULT_DATA_DIR = Path.home() / '.local' / 'share' / 'orion-football-alerts'
 BROADCASTERS_BY_COLUMN = {'1': 'Globo', '2': 'Record', '3': 'Sportv', '4': 'Amazon', '5': 'Youtube / Cazé TV', '6': 'GE TV', '7': 'Premiere'}
@@ -350,6 +351,220 @@ def parse_pdf_line(line: str, config: dict[str, Any], current_round: int | None 
     venue, city, state, broadcasters = _pdf_location_and_broadcast(rest)
     return {'match_id': stable_match_id('CBF', config['competition'], config['season'], reference, home.strip(), away.strip()), 'reference': reference, 'round': round_number, 'home_team': home.strip(), 'away_team': away.strip(), 'kickoff': kickoff.isoformat(timespec='seconds'), 'schedule_date': kickoff.date().isoformat(), 'schedule_time': f'{hour:02d}:{minute:02d}', 'schedule_note': None, 'venue': venue, 'city': city, 'state': state, 'broadcasters': broadcasters, 'status': 'scheduled'}
 
+
+def discover_competition_id(table_html: str) -> str:
+    patterns = [
+        r'\\"competitionId\\"\s*:\s*\\"?(\d+)',
+        r'"competitionId"\s*:\s*"?(\d+)',
+        r'competitionId[^0-9]{0,30}(\d+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, table_html, flags=re.I)
+        if match:
+            return match.group(1)
+    raise FutebolError('Tabela online da CBF não informou competitionId.')
+
+
+def normalize_api_game(game: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    reference = str(game.get('id_jogo') or game.get('num_jogo') or '').strip()
+    round_number = int(str(game.get('rodada') or '0').strip())
+
+    home_data = game.get('mandante') if isinstance(game.get('mandante'), dict) else {}
+    away_data = game.get('visitante') if isinstance(game.get('visitante'), dict) else {}
+
+    home_team = str(home_data.get('nome') or '').strip()
+    away_team = str(away_data.get('nome') or '').strip()
+
+    if not reference or round_number <= 0 or not home_team or not away_team:
+        raise FutebolError(f'Jogo incompleto retornado pela API oficial: {reference or "sem referência"}')
+
+    raw_date = str(game.get('data') or '').strip()
+    raw_time = str(game.get('hora') or '').strip()
+    venue, city, state = parse_location(str(game.get('local') or '').strip())
+
+    base = {
+        'match_id': stable_match_id(
+            'CBF',
+            config['competition'],
+            config['season'],
+            reference,
+            home_team,
+            away_team,
+        ),
+        'reference': reference,
+        'round': round_number,
+        'home_team': home_team,
+        'away_team': away_team,
+        'venue': venue,
+        'city': city,
+        'state': state,
+        'broadcasters': [],
+        'official_game_id': reference,
+        'source_fields': {
+            'schedule': 'cbf_table_api',
+            'teams': 'cbf_table_api',
+            'location': 'cbf_table_api',
+        },
+    }
+
+    date_match = re.fullmatch(r'(\d{2})/(\d{2})/(\d{4})', raw_date)
+    time_match = re.fullmatch(r'(\d{1,2}):(\d{2})', raw_time)
+
+    if not date_match or not time_match:
+        return {
+            **base,
+            'kickoff': None,
+            'schedule_date': None,
+            'schedule_time': None,
+            'schedule_note': 'Data e horário a definir pela CBF',
+            'status': 'unscheduled',
+        }
+
+    day, month, year = map(int, date_match.groups())
+    hour, minute = map(int, time_match.groups())
+    kickoff = datetime(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        tzinfo=ZoneInfo(config['timezone']),
+    )
+
+    return {
+        **base,
+        'kickoff': kickoff.isoformat(timespec='seconds'),
+        'schedule_date': kickoff.date().isoformat(),
+        'schedule_time': f'{hour:02d}:{minute:02d}',
+        'schedule_note': None,
+        'status': 'scheduled',
+    }
+
+
+def download_and_normalize_table_api(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    settings = source_config(config)
+    table_url = approved_url(settings.get('table_url') or REAL_TABLE_DEFAULT)
+
+    table_body, table_response, _ = _download(
+        table_url,
+        config,
+        'text/html',
+    )
+    table_html = table_body.decode('utf-8', errors='replace')
+    competition_id = str(
+        settings.get('competition_id') or discover_competition_id(table_html)
+    ).strip()
+
+    matches_by_id: dict[str, dict[str, Any]] = {}
+    round_urls: list[str] = []
+    raw_rounds: dict[str, Any] = {}
+
+    for round_number in range(1, 39):
+        api_url = (
+            'https://www.cbf.com.br/api/cbf/jogos/campeonato/'
+            f'{competition_id}/rodada/{round_number}/fase'
+        )
+        round_urls.append(api_url)
+
+        body, _, _ = _download(api_url, config, 'application/json')
+
+        try:
+            payload = json.loads(body.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FutebolError(
+                f'API oficial retornou JSON inválido na rodada {round_number}.'
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise FutebolError(
+                f'API oficial retornou estrutura inválida na rodada {round_number}.'
+            )
+
+        raw_rounds[str(round_number)] = payload
+
+        groups = payload.get('jogos')
+        if not isinstance(groups, list):
+            raise FutebolError(
+                f'API oficial não retornou jogos na rodada {round_number}.'
+            )
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+
+            games = group.get('jogo')
+            if not isinstance(games, list):
+                continue
+
+            for game in games:
+                if not isinstance(game, dict):
+                    continue
+                normalized = normalize_api_game(game, config)
+                matches_by_id[normalized['match_id']] = normalized
+
+    matches = sorted(matches_by_id.values(), key=match_sort_key)
+
+    if not matches:
+        raise FutebolError('API oficial da CBF não retornou partidas.')
+
+    source = {
+        'provider': 'CBF',
+        'source_type': 'cbf_table_api',
+        'url': table_url,
+        'final_url': (
+            table_response.geturl()
+            if hasattr(table_response, 'geturl')
+            else table_url
+        ),
+        'status': 'real',
+        'fetched_at': now_iso(config['timezone']),
+        'document_sha256': hashlib.sha256(
+            json.dumps(
+                raw_rounds,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest(),
+        'content_length': sum(
+            len(json.dumps(value, ensure_ascii=False).encode('utf-8'))
+            for value in raw_rounds.values()
+        ),
+        'content_type': 'application/json',
+        'competition_id': competition_id,
+        'rounds_consulted': 38,
+        'api_urls': round_urls,
+        'fallback_used': False,
+    }
+
+    candidate = {
+        'schema_version': 1,
+        'data_mode': 'real',
+        'competition': config['competition'],
+        'competition_display_name': config.get(
+            'competition_display_name',
+            '',
+        ),
+        'season': int(config['season']),
+        'timezone': config['timezone'],
+        'source': source,
+        'matches': matches,
+    }
+
+    raw_payload = json.dumps(
+        {
+            'table_url': table_url,
+            'competition_id': competition_id,
+            'rounds': raw_rounds,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ).encode('utf-8')
+
+    return candidate, source, raw_payload
+
 def normalize_pdf_real(config: dict[str, Any], extraction: PdfExtraction, download: PdfDownload | None = None) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     current_round: int | None = None
@@ -534,36 +749,144 @@ def refresh_real(config: dict[str, Any]) -> tuple[str, Path, dict[str, Any]]:
     active_path = normalized_path(config, 'real')
     previous: dict[str, Any] | None = None
     previous_sha = ''
-    download: PdfDownload | None = None
-    extraction: PdfExtraction | None = None
     candidate: dict[str, Any] | None = None
     candidate_sha = ''
+    download: PdfDownload | None = None
+    extraction: PdfExtraction | None = None
+    primary_error = ''
+    source_type = 'pdf_fallback'
+    raw_api_payload: bytes | None = None
+
     try:
         previous, previous_sha = read_valid_previous(config, active_path)
-        download = download_pdf_from_article(config)
-        extraction = extract_pdf_text(download.body)
-        candidate = normalize_pdf_real(config, extraction, download)
+
+        if bool(source_config(config).get('table_api_enabled', False)):
+            try:
+                candidate, _, raw_api_payload = (
+                    download_and_normalize_table_api(config)
+                )
+                source_type = 'cbf_table_api'
+            except Exception as exc:
+                primary_error = str(exc)
+                candidate = None
+
+        if candidate is None:
+            download = download_pdf_from_article(config)
+            extraction = extract_pdf_text(download.body)
+            candidate = normalize_pdf_real(config, extraction, download)
+            source_type = 'pdf_fallback'
+
         validate_real_candidate(config, candidate)
+
+        if source_type == 'pdf_fallback':
+            candidate['source']['source_type'] = 'pdf_fallback'
+            candidate['source']['fallback_used'] = True
+            candidate['source']['primary_error'] = primary_error
+
         candidate_sha = canonical_sha256(candidate)
-        result = 'UNCHANGED' if previous_sha and previous_sha == candidate_sha else 'UPDATED'
-        raw_pdf_path = raw_path(config, f'cbf_{config["season"]}_real.pdf')
-        write_bytes_atomic(raw_pdf_path, download.body)
-        manifest = _manifest(config, result=result, active_path=active_path, previous_sha=previous_sha, candidate_sha=candidate_sha, download=download, page_count=extraction.page_count, match_count=len(candidate['matches']))
+
+        result = (
+            'UNCHANGED'
+            if previous_sha and previous_sha == candidate_sha
+            else 'UPDATED'
+        )
+
+        if source_type == 'cbf_table_api' and raw_api_payload is not None:
+            write_bytes_atomic(
+                raw_path(config, f'cbf_{config["season"]}_table_api.json'),
+                raw_api_payload,
+            )
+        elif download is not None:
+            write_bytes_atomic(
+                raw_path(config, f'cbf_{config["season"]}_real.pdf'),
+                download.body,
+            )
+
+        manifest = _manifest(
+            config,
+            result=result,
+            active_path=active_path,
+            previous_sha=previous_sha,
+            candidate_sha=candidate_sha,
+            download=download,
+            page_count=extraction.page_count if extraction else 0,
+            match_count=len(candidate['matches']),
+        )
+
+        source = candidate.get('source', {})
+        manifest.update({
+            'primary_source': source_type,
+            'table_url': source.get('url', ''),
+            'competition_id': source.get('competition_id', ''),
+            'rounds_consulted': source.get('rounds_consulted', 0),
+            'fallback_used': bool(source.get('fallback_used', False)),
+            'primary_error': primary_error,
+            'source_document_sha256': source.get(
+                'document_sha256',
+                '',
+            ),
+        })
+
         write_json_atomic(manifest_path(config), manifest)
+
         if result == 'UPDATED':
             write_json_atomic(active_path, candidate)
+
         return result, active_path, manifest
+
     except Exception as exc:
-        error = exc if isinstance(exc, FutebolError) else FutebolError(f'Falha na atualização real: {exc}')
-        result = 'FAILED_PRESERVED' if previous is not None else 'NO_PREVIOUS_DATA'
-        candidate_matches = candidate.get('matches') if isinstance(candidate, dict) else None
-        manifest = _manifest(config, result=result, active_path=active_path, previous_sha=previous_sha, candidate_sha=candidate_sha, download=download, page_count=extraction.page_count if extraction else 0, match_count=len(candidate_matches) if isinstance(candidate_matches, list) else 0, error=str(error))
+        error = (
+            exc
+            if isinstance(exc, FutebolError)
+            else FutebolError(f'Falha na atualização real: {exc}')
+        )
+        result = (
+            'FAILED_PRESERVED'
+            if previous is not None
+            else 'NO_PREVIOUS_DATA'
+        )
+        candidate_matches = (
+            candidate.get('matches')
+            if isinstance(candidate, dict)
+            else None
+        )
+
+        manifest = _manifest(
+            config,
+            result=result,
+            active_path=active_path,
+            previous_sha=previous_sha,
+            candidate_sha=candidate_sha,
+            download=download,
+            page_count=extraction.page_count if extraction else 0,
+            match_count=(
+                len(candidate_matches)
+                if isinstance(candidate_matches, list)
+                else 0
+            ),
+            error=str(error),
+        )
+        manifest.update({
+            'primary_source': source_type,
+            'primary_error': primary_error,
+        })
+
         try:
             write_json_atomic(manifest_path(config), manifest)
         except Exception as manifest_exc:
-            raise FutebolError(f'{result}: {error}; falha ao registrar manifesto: {manifest_exc}') from exc
-        preservation = 'snapshot anterior preservado' if previous is not None else 'não existe snapshot anterior válido'
-        raise FutebolError(f'{result}: {error}; {preservation}.') from exc
+            raise FutebolError(
+                f'{result}: {error}; '
+                f'falha ao registrar manifesto: {manifest_exc}'
+            ) from exc
+
+        preservation = (
+            'snapshot anterior preservado'
+            if previous is not None
+            else 'não existe snapshot anterior válido'
+        )
+        raise FutebolError(
+            f'{result}: {error}; {preservation}.'
+        ) from exc
 
 def write_fixture_raw(config: dict[str, Any], snapshot: SourceSnapshot) -> Path:
     ensure_dirs(config)

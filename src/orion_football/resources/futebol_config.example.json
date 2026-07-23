@@ -21,6 +21,9 @@
     "max_download_bytes": 5000000,
     "min_match_count": 10,
     "max_match_count": 1000,
-    "user_agent": "orion-football-alerts/0.1 (official CBF source reader)"
+    "user_agent": "orion-football-alerts/0.1 (official CBF source reader)",
+    "table_api_enabled": false,
+    "table_url": "https://www.cbf.com.br/futebol-brasileiro/tabelas/campeonato-brasileiro/serie-a/2026",
+    "competition_id": "1260611"
   }
 }

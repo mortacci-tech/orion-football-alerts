@@ -342,4 +342,79 @@ class FutebolTests(unittest.TestCase):
                 self.assertEqual(futebol.main(["--config", str(config_path), "pregame", "--source", "real", "--date", "2026-07-23", "--minutes", "10"]), 0)
             network.assert_not_called()
 
+
+    def test_normalize_api_game_scheduled(self):
+        config = {
+            "competition": "campeonato_brasileiro_serie_a",
+            "season": 2026,
+            "timezone": "America/Sao_Paulo",
+        }
+        game = {
+            "id_jogo": "832073",
+            "num_jogo": "184",
+            "rodada": "19",
+            "mandante": {"nome": "Corinthians"},
+            "visitante": {"nome": "Remo"},
+            "local": "Neo Química Arena - Sao Paulo - SP",
+            "data": " 23/07/2026",
+            "hora": "19:30",
+        }
+
+        result = futebol.normalize_api_game(game, config)
+
+        self.assertEqual(result["reference"], "832073")
+        self.assertEqual(result["round"], 19)
+        self.assertEqual(result["home_team"], "Corinthians")
+        self.assertEqual(result["away_team"], "Remo")
+        self.assertEqual(result["schedule_date"], "2026-07-23")
+        self.assertEqual(result["schedule_time"], "19:30")
+        self.assertEqual(result["status"], "scheduled")
+        self.assertEqual(result["venue"], "Neo Química Arena")
+        self.assertEqual(result["city"], "Sao Paulo")
+        self.assertEqual(result["state"], "SP")
+        self.assertEqual(
+            result["source_fields"]["schedule"],
+            "cbf_table_api",
+        )
+
+    def test_normalize_api_game_unscheduled(self):
+        config = {
+            "competition": "campeonato_brasileiro_serie_a",
+            "season": 2026,
+            "timezone": "America/Sao_Paulo",
+        }
+        game = {
+            "id_jogo": "999999",
+            "rodada": "20",
+            "mandante": {"nome": "Flamengo"},
+            "visitante": {"nome": "Palmeiras"},
+            "local": "",
+            "data": "",
+            "hora": "",
+        }
+
+        result = futebol.normalize_api_game(game, config)
+
+        self.assertEqual(result["status"], "unscheduled")
+        self.assertIsNone(result["kickoff"])
+        self.assertIsNone(result["schedule_date"])
+        self.assertIsNone(result["schedule_time"])
+        self.assertIn("definir", result["schedule_note"])
+
+    def test_discover_competition_id(self):
+        html = r'self.__next_f.push([1,"competitionId\":1260611"])'
+
+        self.assertEqual(
+            futebol.discover_competition_id(html),
+            "1260611",
+        )
+
+    def test_discover_competition_id_ausente(self):
+        with self.assertRaisesRegex(
+            futebol.FutebolError,
+            "competitionId",
+        ):
+            futebol.discover_competition_id("<html></html>")
+
+
 if __name__ == "__main__": unittest.main()
