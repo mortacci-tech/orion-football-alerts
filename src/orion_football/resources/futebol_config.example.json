@@ -8,8 +8,12 @@
   "pregame_minutes": 15,
   "data_dir": "~/.local/share/orion-football-alerts",
   "alerts": {
-    "round_overview": {"enabled": true},
-    "owner_team_round": {"enabled": true}
+    "round_overview": {
+      "enabled": true
+    },
+    "owner_team_round": {
+      "enabled": true
+    }
   },
   "source": {
     "provider": "CBF",
@@ -24,6 +28,8 @@
     "user_agent": "orion-football-alerts/0.1 (official CBF source reader)",
     "table_api_enabled": false,
     "table_url": "https://www.cbf.com.br/futebol-brasileiro/tabelas/campeonato-brasileiro/serie-a/2026",
-    "competition_id": "1260611"
+    "competition_id": "1260611",
+    "curl_tls_fallback_enabled": false,
+    "curl_path": "/usr/bin/curl"
   }
 }

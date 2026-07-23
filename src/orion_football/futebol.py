@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -55,6 +56,36 @@ class PdfExtraction:
     text: str
     pages: tuple[str, ...]
     page_count: int
+
+
+class DownloadHeaders:
+    def __init__(self, content_type: str):
+        self._content_type = str(content_type or "").strip()
+
+    def get_content_type(self) -> str:
+        return self._content_type.split(";", 1)[0].strip().lower()
+
+    def get(self, name: str, default: Any = None) -> Any:
+        if str(name).lower() == "content-type":
+            return self._content_type or default
+        return default
+
+
+@dataclass(frozen=True)
+class DownloadResponse:
+    final_url: str
+    status: int
+    content_type: str
+
+    @property
+    def headers(self) -> DownloadHeaders:
+        return DownloadHeaders(self.content_type)
+
+    def geturl(self) -> str:
+        return self.final_url
+
+    def getcode(self) -> int:
+        return self.status
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path:
     if explicit:
@@ -147,37 +178,237 @@ def approved_url(value: str, *, document: bool = False) -> str:
         raise FutebolError(f'URL de documento CBF não é PDF: {value}')
     return value
 
-def _download(url: str, config: dict[str, Any], accept: str) -> tuple[bytes, Any, int]:
+def _certificate_verify_failure(exc: BaseException) -> bool:
+    reason = getattr(exc, 'reason', exc)
+    detail = str(reason).upper()
+    return (
+        'CERTIFICATE_VERIFY_FAILED' in detail
+        or 'UNABLE TO GET LOCAL ISSUER CERTIFICATE' in detail
+    )
+
+
+def _download_with_curl(
+    url: str,
+    config: dict[str, Any],
+    accept: str,
+) -> tuple[bytes, DownloadResponse, int]:
+    settings = source_config(config)
+    approved = approved_url(url)
+    max_bytes = int(settings.get('max_download_bytes', 5_000_000))
+    timeout = float(settings.get('timeout_seconds', 20))
+    user_agent = str(
+        settings.get(
+            'user_agent',
+            'orion-football-alerts/0.1',
+        )
+    )
+
+    curl_path = str(settings.get('curl_path') or '/usr/bin/curl')
+    executable = Path(curl_path)
+
+    if not executable.is_file():
+        raise FutebolError(
+            f'Fallback TLS indisponível: curl não localizado em {curl_path}.'
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix='orion-football-curl-'
+    ) as directory:
+        temporary = Path(directory)
+        body_path = temporary / 'body.bin'
+
+        command = [
+            curl_path,
+            '--silent',
+            '--show-error',
+            '--location',
+            '--fail',
+            '--max-time',
+            str(max(1, int(timeout))),
+            '--max-filesize',
+            str(max_bytes),
+            '--user-agent',
+            user_agent,
+            '--header',
+            f'Accept: {accept}',
+            '--output',
+            str(body_path),
+            '--write-out',
+            '%{http_code}\\n%{url_effective}\\n%{content_type}',
+            approved,
+        ]
+
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=timeout + 5,
+                shell=False,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise FutebolError(
+                f'Fallback TLS com curl falhou: {exc}.'
+            ) from exc
+
+        if completed.returncode != 0:
+            detail = (
+                completed.stderr
+                or completed.stdout
+                or f'código {completed.returncode}'
+            ).strip()
+            raise FutebolError(
+                f'Fallback TLS com curl falhou: {detail}.'
+            )
+
+        metadata = completed.stdout.splitlines()
+        if len(metadata) < 3:
+            raise FutebolError(
+                'Fallback TLS com curl retornou metadados incompletos.'
+            )
+
+        try:
+            status = int(metadata[-3].strip())
+        except ValueError as exc:
+            raise FutebolError(
+                'Fallback TLS com curl retornou HTTP inválido.'
+            ) from exc
+
+        final_url = approved_url(metadata[-2].strip())
+        content_type = metadata[-1].strip()
+
+        if not 200 <= status < 300:
+            raise FutebolError(
+                f'Fonte CBF respondeu HTTP {status}.'
+            )
+
+        if not body_path.is_file():
+            raise FutebolError(
+                'Fallback TLS com curl não produziu conteúdo.'
+            )
+
+        body = body_path.read_bytes()
+
+        if len(body) > max_bytes:
+            raise FutebolError(
+                f'Download da CBF excede o limite de {max_bytes} bytes.'
+            )
+
+        content_main = (
+            content_type.split(';', 1)[0].strip().lower()
+        )
+
+        if (
+            accept == 'text/html'
+            and content_main
+            not in {'text/html', 'application/xhtml+xml'}
+        ):
+            raise FutebolError(
+                'Tipo de conteúdo inesperado no artigo CBF: '
+                f'{content_main}.'
+            )
+
+        response = DownloadResponse(
+            final_url=final_url,
+            status=status,
+            content_type=content_type,
+        )
+        return body, response, status
+
+
+def _download(
+    url: str,
+    config: dict[str, Any],
+    accept: str,
+) -> tuple[bytes, Any, int]:
     settings = source_config(config)
     max_bytes = int(settings.get('max_download_bytes', 5_000_000))
-    request = Request(approved_url(url), headers={
-        'User-Agent': settings.get('user_agent', 'orion-football-alerts/0.1'),
-        'Accept': accept,
-    })
+    approved = approved_url(url)
+
+    request = Request(
+        approved,
+        headers={
+            'User-Agent': settings.get(
+                'user_agent',
+                'orion-football-alerts/0.1',
+            ),
+            'Accept': accept,
+        },
+    )
+
     try:
-        with urlopen(request, timeout=float(settings.get('timeout_seconds', 20))) as response:
-            status = int(getattr(response, 'status', None) or response.getcode())
+        with urlopen(
+            request,
+            timeout=float(settings.get('timeout_seconds', 20)),
+        ) as response:
+            status = int(
+                getattr(response, 'status', None)
+                or response.getcode()
+            )
+
             if not 200 <= status < 300:
-                raise FutebolError(f'Fonte CBF respondeu HTTP {status}.')
-            content_main = response.headers.get_content_type().lower()
-            if accept == 'text/html' and content_main not in {'text/html', 'application/xhtml+xml'}:
-                raise FutebolError(f'Tipo de conteúdo inesperado no artigo CBF: {content_main}.')
+                raise FutebolError(
+                    f'Fonte CBF respondeu HTTP {status}.'
+                )
+
+            content_main = (
+                response.headers.get_content_type().lower()
+            )
+
+            if (
+                accept == 'text/html'
+                and content_main
+                not in {'text/html', 'application/xhtml+xml'}
+            ):
+                raise FutebolError(
+                    'Tipo de conteúdo inesperado no artigo CBF: '
+                    f'{content_main}.'
+                )
+
             chunks: list[bytes] = []
             total = 0
+
             while True:
-                chunk = response.read(min(65_536, max_bytes - total + 1))
+                chunk = response.read(
+                    min(65_536, max_bytes - total + 1)
+                )
                 if not chunk:
                     break
+
                 total += len(chunk)
+
                 if total > max_bytes:
-                    raise FutebolError(f'Download da CBF excede o limite de {max_bytes} bytes.')
+                    raise FutebolError(
+                        'Download da CBF excede o limite de '
+                        f'{max_bytes} bytes.'
+                    )
+
                 chunks.append(chunk)
+
             return b''.join(chunks), response, status
+
     except HTTPError as exc:
-        raise FutebolError(f'Fonte CBF respondeu HTTP {exc.code}.') from exc
+        raise FutebolError(
+            f'Fonte CBF respondeu HTTP {exc.code}.'
+        ) from exc
+
     except (TimeoutError, URLError, OSError) as exc:
+        use_curl = bool(
+            settings.get('curl_tls_fallback_enabled', False)
+        )
+
+        if use_curl and _certificate_verify_failure(exc):
+            return _download_with_curl(
+                approved,
+                config,
+                accept,
+            )
+
         reason = getattr(exc, 'reason', exc)
-        raise FutebolError(f'Falha ao acessar a fonte CBF: {reason}.') from exc
+        raise FutebolError(
+            f'Falha ao acessar a fonte CBF: {reason}.'
+        ) from exc
 
 def discover_document_url(article_html: str, config: dict[str, Any], base_url: str = REAL_URL_DEFAULT) -> str:
     pattern = source_config(config).get('document_name_pattern', r'Tabela_Detalhada.*\.pdf')

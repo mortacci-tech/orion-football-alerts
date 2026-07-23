@@ -417,4 +417,88 @@ class FutebolTests(unittest.TestCase):
             futebol.discover_competition_id("<html></html>")
 
 
+
+    def test_certificate_verify_failure(self):
+        error = futebol.URLError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] "
+            "unable to get local issuer certificate"
+        )
+        self.assertTrue(
+            futebol._certificate_verify_failure(error)
+        )
+        self.assertFalse(
+            futebol._certificate_verify_failure(
+                futebol.URLError("conexão recusada")
+            )
+        )
+
+    def test_download_usa_curl_somente_em_falha_de_certificado(self):
+        config = {
+            "owner_team": "Flamengo",
+            "season": 2026,
+            "timezone": "America/Sao_Paulo",
+            "source": {
+                "curl_tls_fallback_enabled": True,
+            },
+        }
+
+        expected = (
+            b"<html>ok</html>",
+            futebol.DownloadResponse(
+                final_url="https://www.cbf.com.br/teste",
+                status=200,
+                content_type="text/html; charset=utf-8",
+            ),
+            200,
+        )
+
+        certificate_error = futebol.URLError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] "
+            "unable to get local issuer certificate"
+        )
+
+        with patch(
+            "orion_football.futebol.urlopen",
+            side_effect=certificate_error,
+        ), patch(
+            "orion_football.futebol._download_with_curl",
+            return_value=expected,
+        ) as curl:
+            result = futebol._download(
+                "https://www.cbf.com.br/teste",
+                config,
+                "text/html",
+            )
+
+        self.assertEqual(result, expected)
+        curl.assert_called_once()
+
+    def test_download_nao_usa_curl_em_erro_comum(self):
+        config = {
+            "owner_team": "Flamengo",
+            "season": 2026,
+            "timezone": "America/Sao_Paulo",
+            "source": {
+                "curl_tls_fallback_enabled": True,
+            },
+        }
+
+        with patch(
+            "orion_football.futebol.urlopen",
+            side_effect=futebol.URLError("conexão recusada"),
+        ), patch(
+            "orion_football.futebol._download_with_curl",
+        ) as curl:
+            with self.assertRaisesRegex(
+                futebol.FutebolError,
+                "conexão recusada",
+            ):
+                futebol._download(
+                    "https://www.cbf.com.br/teste",
+                    config,
+                    "text/html",
+                )
+
+        curl.assert_not_called()
+
 if __name__ == "__main__": unittest.main()
